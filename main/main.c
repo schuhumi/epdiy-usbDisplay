@@ -5,6 +5,7 @@
 #include <esp_types.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/stream_buffer.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -12,9 +13,6 @@
 #include <epdiy.h>
 
 #include "sdkconfig.h"
-
-//#include "firasans_12.h"
-//#include "firasans_20.h"
 
 #include "tinyusb.h"
 #include "tusb_cdc_acm.h"
@@ -78,20 +76,11 @@ const uint8_t cursor_pointer[] = {
 const uint8_t cursor_pointer_width = 10;
 const uint8_t cursor_pointer_height = 16;
 
-/*#define ringlen 8192
-uint8_t ringbuf[ringlen];
-uint16_t ringwriter = 1;
-uint16_t ringreader = 0;*/
 
-uint8_t buf[8][CONFIG_TINYUSB_CDC_RX_BUFSIZE + 1];
-volatile size_t buf_size[8] = {0};
-volatile uint8_t buf_write_selector_current=0;
-volatile uint8_t buf_read_selector_current=0;
-#define WRITE_SELECTOR_INACTIVE 0
-#define WRITE_SELECTOR_USED_BY_WRITER 1
-#define WRITE_SELECTOR_USED_BY_READER 2
-volatile uint8_t write_selector_user = WRITE_SELECTOR_INACTIVE;
-
+size_t xCDCStreamBufferSize = CONFIG_TINYUSB_CDC_RX_BUFSIZE*2;
+static StreamBufferHandle_t xCDCStreamBuffer = NULL;
+uint8_t *xCDCStreamBufferBuf = NULL;
+StaticStreamBuffer_t xCDCStreamBufferStruct;
 
 static const char *TAG = "EPDiyGraphics";
 
@@ -424,7 +413,7 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                         refresh_ctr += (refresh_area_coords.width>>9)*(refresh_area_coords.height>>9);
                         enum EpdDrawMode mode;
                         mode = (enum EpdDrawMode)(MODE_DU | MODE_PACKING_1PPB_DIFFERENCE);
-                        if(false) { //if(refresh_ctr>=100) {
+                        if(refresh_ctr>=100) {
                             refresh_ctr = 0;
                             for(size_t i=0; i<fb_size; i++)
                                 fb[i] = (fb[i] & 0x0F) | (~fb[i] & 0xF0);
@@ -483,7 +472,6 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                                     )
                                         continue;
                                     uint8_t* fb_px = fb_by_row[fb_y]+fb_x;
-                                    uint16_t cursor_idx = (y*cursor_pointer_width)+x;
                                     *fb_px = (*fb_px&0xF0) | ((*fb_px>>4)&0x0F);
                                 }
                             }
@@ -536,43 +524,26 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
 
 
 
-
+uint8_t* buf_tmp_rec = NULL;
 void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event)
 {
-    CDC_RX_AQUIRE_LOCK:
-    while(write_selector_user!=WRITE_SELECTOR_INACTIVE){
-        vTaskDelay(1);
-    }
-    write_selector_user = WRITE_SELECTOR_USED_BY_WRITER;
-    asm volatile ("nop");
-    if(write_selector_user!=WRITE_SELECTOR_USED_BY_WRITER)
-        goto CDC_RX_AQUIRE_LOCK;
-
-    uint8_t buf_write_selector_next = (buf_write_selector_current+1)&0b111;
-    if(buf_size[buf_write_selector_current]>=CONFIG_TINYUSB_CDC_RX_BUFSIZE) {
-        while( buf_write_selector_next == buf_read_selector_current ) {
-            // wait
-            printf("Waiting to write buf %d\n", buf_write_selector_next);
-            vTaskDelay(10);
-        }
-        buf_write_selector_current = buf_write_selector_next;
-        buf_write_selector_next = (buf_write_selector_next+1)&0b111;
-        buf_size[buf_write_selector_current] = 0;
-    }
     size_t bytes_written;
     esp_err_t ret = tinyusb_cdcacm_read(
         itf,
-        buf[buf_write_selector_current]+buf_size[buf_write_selector_current],
-        CONFIG_TINYUSB_CDC_RX_BUFSIZE-buf_size[buf_write_selector_current],
+        buf_tmp_rec,
+        CONFIG_TINYUSB_CDC_RX_BUFSIZE,
         &bytes_written
     );
-    buf_size[buf_write_selector_current] += bytes_written;
-    /*if (ret == ESP_OK) {
-        printf("Appended %d bytes to buf %d\n", bytes_written, buf_write_selector_current);
+    if (ret == ESP_OK) {
+        xStreamBufferSend(
+            xCDCStreamBuffer,
+            buf_tmp_rec,
+            bytes_written,
+            portMAX_DELAY
+        );
     } else {
         ESP_LOGE(TAG, "Read error");
-    }*/
-    write_selector_user = WRITE_SELECTOR_INACTIVE;
+    }
 }
 
 void tinyusb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event)
@@ -583,6 +554,7 @@ void tinyusb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event)
 }
 
 void idf_setup() {
+
     epd_init(&DEMO_BOARD, &ED133UT2, EPD_LUT_64K);
     // Set VCOM for boards that allow to set this in software (in mV).
     // This will print an error if unsupported. In this case,
@@ -607,6 +579,15 @@ void idf_setup() {
     printf(
         "Dimensions after rotation, width: %d height: %d\n\n", epd_rotated_display_width(),
         epd_rotated_display_height()
+    );
+
+    buf_tmp_rec = heap_caps_malloc(CONFIG_TINYUSB_CDC_RX_BUFSIZE+1, MALLOC_CAP_SPIRAM);
+    xCDCStreamBufferBuf = heap_caps_malloc(xCDCStreamBufferSize+1, MALLOC_CAP_SPIRAM);
+    xCDCStreamBuffer = xStreamBufferCreateStatic(
+        xCDCStreamBufferSize,  // size in bytes
+        1,  // trigger level
+        xCDCStreamBufferBuf,
+        &xCDCStreamBufferStruct
     );
 
     heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
@@ -647,57 +628,31 @@ void idf_setup() {
 
 
 void idf_loop() {
-    // select the font based on display width
-    /*const EpdFont* font;
-    if (epd_width() < 1000) {
-        font = &FiraSans_12;
-    } else {
-        font = &FiraSans_20;
-    }*/
-
-    //uint8_t* fb = epd_hl_get_framebuffer(&hl);
 
     epd_poweron();
     epd_clear();
     temperature = epd_ambient_temperature();
-    //epd_poweroff();
 
     printf("current temperature: %d\n", temperature);
 
+    uint8_t* buf = heap_caps_malloc(CONFIG_TINYUSB_CDC_RX_BUFSIZE+1, MALLOC_CAP_SPIRAM);
+    size_t bytes_written;
     while (1) {
-        while(buf_write_selector_current == buf_read_selector_current) {
-            
-            if((write_selector_user==WRITE_SELECTOR_INACTIVE) && (buf_size[buf_write_selector_current]>0)) {
-                write_selector_user = WRITE_SELECTOR_USED_BY_READER;
-                asm volatile ("nop");
-                if(write_selector_user==WRITE_SELECTOR_USED_BY_READER) {
-                    if(buf_write_selector_current == buf_read_selector_current) {
-                        printf(
-                            "Caught up to non-empty buffer-to-write at %d, kicking over read selector to next buf\n",
-                            buf_read_selector_current
-                        );
-                        buf_write_selector_current = (buf_write_selector_current+1)&0b111;
-                        buf_size[buf_write_selector_current] = 0;
-                    }
-                    write_selector_user = WRITE_SELECTOR_INACTIVE;
-                }
-            } else {
-                //printf("Caught up to empty buffer-to-write at %d, waiting...\n", buf_read_selector_current);
-                vTaskDelay(1);
-            }
-        }
-        
-        digest_stream(
-            buf[buf_read_selector_current],
-            buf_size[buf_read_selector_current]
+        bytes_written = xStreamBufferReceive(
+            xCDCStreamBuffer,
+            buf,
+            CONFIG_TINYUSB_CDC_RX_BUFSIZE,
+            portMAX_DELAY
         );
-        printf("Read %d bytes from buf %d\n", buf_size[buf_read_selector_current], buf_read_selector_current);
-        buf_read_selector_current = (buf_read_selector_current+1)&0b111;
+        digest_stream(
+            buf,
+            bytes_written
+        );
+        printf("Digested %d bytes\n", bytes_written);
     }
 
     printf("going to sleep...\n");
     epd_deinit();
-    //esp_deep_sleep_start();
 }
 
 #ifndef ARDUINO_ARCH_ESP32
