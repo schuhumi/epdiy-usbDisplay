@@ -4,16 +4,19 @@
 #include <esp_timer.h>
 #include <esp_types.h>
 #include <esp_async_memcpy.h>
-#include <rom/cache.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/stream_buffer.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
-#include <utility>
+
 
 #include <epdiy.h>
+
+#include "mycache.h"
+#include "utils.h"
+#include "asm_templates.h"
 
 #include "sdkconfig.h"
 
@@ -25,56 +28,8 @@ using namespace std;
 
 extern "C" void app_main();
 
-#define max(a,b) \
-   ({ __typeof__ (a) _a = (a); \
-       __typeof__ (b) _b = (b); \
-     _a > _b ? _a : _b; })
-
-#define min(a,b) \
-   ({ __typeof__ (a) _a = (a); \
-       __typeof__ (b) _b = (b); \
-     _a > _b ? _b : _a; })
 
 
-
-#define INL __attribute__((always_inline))
-
-/**
- * @brief Uses Xtensa's zero-overhead loop to execute a given operation a number of times.
- * This function does \e not save/restore the LOOP registers, so if required these need to be 
- * saved&restored explicitly around the function call.
- * @note This may fail to assemble when compiled with \c -Og or less
- * 
- * @tparam F Type of the functor to execute
- * @tparam Args Argument types of the functor
- * @param cnt Number of iterations
- * @param f The functor to invoke
- * @param args Arguments to pass to the functor
- */
-template<typename F, typename...Args>
-static inline void INL rpt(const uint32_t cnt, const F& f, Args&&...args) {
-
-    bgn:
-        asm goto (
-            "LOOPNEZ %[cnt], %l[end]"
-            : /* no output*/
-            : [cnt] "r" (cnt)
-            : /* no clobbers */
-            : end
-        );
-
-            f(std::forward<Args>(args)...);
-
- 
-    end:
-        /* Tell the compiler that the above code might execute more than once.
-           The begin label must be before the inital LOOP asm because otherwise
-           gcc may decide to put one-off setup code between the LOOP asm and the
-           begin label, i.e. inside the loop.
-        */
-        asm goto ("":::: bgn);    
-        ;
-}
 
 #define WAVEFORM EPD_BUILTIN_WAVEFORM
 
@@ -225,10 +180,9 @@ void IRAM_ATTR do_refresh(void) {
                 break;
         }
         if(yy<_epd_height) {
-            Cache_Start_DCache_Preload(
-                ((uint32_t)fb_by_row[yy]) + rpt_chunk_start_offset,  // start address of the preload region
-                max(CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE+1, rpt_cnt<<2),  // size of the preload region, should not exceed the size of DCache
-                0  // the preload order, 0 for positive, other for negative
+            My_Cache_Start_DCache_Preload(
+                (uint32_t)fb_by_row[yy] + rpt_chunk_start_offset,
+                rpt_cnt<<2
             );
         }
         while(yy<_epd_height) {
@@ -237,10 +191,9 @@ void IRAM_ATTR do_refresh(void) {
                 next_yy++;
             }
             if(next_yy<_epd_height) {
-                Cache_Start_DCache_Preload(
-                    ((uint32_t)fb_by_row[next_yy]) + rpt_chunk_start_offset,  // start address of the preload region
-                    max(CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE+1, rpt_cnt<<2),  // size of the preload region, should not exceed the size of DCache
-                    0  // the preload order, 0 for positive, other for negative
+                My_Cache_Start_DCache_Preload(
+                    ((uint32_t)fb_by_row[next_yy]) + rpt_chunk_start_offset,
+                    rpt_cnt<<2
                 );
             }
             //ensure_current_line_is(yy, 0, _epd_width, next_yy);
@@ -372,7 +325,9 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, ECHO_SYNC);
                     tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
                     payload_bytes_counter = 0;
+                    continue;
                 default:
+                    ESP_LOGI(TAG, "do not know how to interpret this byte after 'command follows' byte: %hhu", byte);
                     continue;
             };
         }
@@ -388,312 +343,7 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                 };
                 payload_bytes_counter += 1;
                 continue;
-            case DRAW_IMAGE_1BIT:
-                if( payload_bytes_counter >= 4) {
-                                    
-
-                    if( payload_bytes_counter == 4 ) {
-                        // In the first payload byte we find the color and the
-                        // first three bits of the repeat-information
-                        DRAW_IMAGE_1BIT_INNER_LOOP_GET_COLOR: 
-                        draw_image_color = byte & 0b11;
-                        draw_image_repeat = (byte >> 2) & 0b11111;
-                    } else {
-                        // In every payload byte after that, we find seven more
-                        // lower bits of the repeat information
-                        DRAW_IMAGE_1BIT_INNER_LOOP_GET_SHIFT_BITS:
-                        draw_image_repeat <<= 7;
-                        draw_image_repeat |= byte & 0x7F;
-                    }
-                    //ESP_LOGI(TAG, "DRAW_IMAGE_1BIT color=%d repeats=%"PRIu32, draw_image_color, draw_image_repeat);
-
-                    if( (byte) & 0x80 ) {
-                        // There are more shift-bits to come
-                        payload_bytes_counter += 1;
-                        goto DRAW_IMAGE_1BIT_CHECK_NEXT_BYTE_FOR_SHIFT_BITS;
-                    }
-
-                    // We have gathered all the repeat information
-                    if(draw_image_color==0b10) {  // draw transparent pixels
-                        // Shortcut to jump over transparent pixels (=no change on fb)
-                        draw_image_repeat += draw_image_current_x + 1;
-                        draw_image_current_y += draw_image_repeat/draw_image_width;
-                        draw_image_current_x = draw_image_repeat%draw_image_width;
-                    } else {  // draw color or invert
-                        uint16_t yy = origin_y_pos + draw_image_current_y;
-                        uint8_t *fb_yy = fb_by_row[yy];
-                        for(uint32_t px_ctr=0; px_ctr<draw_image_repeat+1;) {
-                            uint16_t xx_start = origin_x_pos + draw_image_current_x;
-                            // xx_stop denotes where we stop drawing the current row of the picture
-                            // (due to different reasons)
-                            uint16_t xx_count = min(
-                                draw_image_repeat+1-px_ctr,
-                                draw_image_width-draw_image_current_x
-                            );
-                            uint8_t *buf_ptr = fb_yy + xx_start;
-                            if(xx_count >= 2) {
-                                // If we have at least 2 repeating pixels left in this row, we take a shortcut,
-                                // as we can skip calculating jumps into the next row, overflowing
-                                // the screen and other checks
-                                uint8_t *buf_ptr_stop = fb_yy + xx_start + xx_count;
-                                // We do differentiate between putting a color and inverting outside
-                                // the loop, so we do not do this branch for every loop iteration again.
-                                if(draw_image_color==0b11) {  // invert
-                                    for(; buf_ptr<buf_ptr_stop; buf_ptr++){
-                                        *buf_ptr = (*buf_ptr & 0x0F) | (~(*buf_ptr) & 0xF0);
-                                    }
-                                } else {
-                                    for(; buf_ptr<buf_ptr_stop; buf_ptr++){
-                                        *buf_ptr = (*buf_ptr & 0x0F) | (draw_image_color&1?0xF0:0x00);
-                                    }
-                                }
-                                // Since we only advanced in the row, we only need to update these
-                                // variables
-                                draw_image_current_x += xx_count;
-                                px_ctr += xx_count;
-                            }
-                            else {
-                                // If we have just 1 or zero repeating pixels left in the row, we take
-                                // care of screen dimensions and draw it
-                                if(draw_image_color==0b11) {
-                                    *buf_ptr = (*buf_ptr & 0x0F) | (~(*buf_ptr) & 0xF0);
-                                } else {
-                                    *buf_ptr = (*buf_ptr & 0x0F) | (draw_image_color&1?0xF0:0x00);
-                                }
-                                draw_image_current_x++;
-                                px_ctr++;
-                            }
-                            // All the logic of wrapping into the next row etc follows here
-                            if( draw_image_current_x + 1 > draw_image_width ) {
-                                draw_image_current_x = 0;
-                                draw_image_current_y++;
-                                yy++;
-                                fb_yy += _epd_width;
-                                if( 
-                                    (draw_image_current_y + 1 > draw_image_height) ||
-                                    (yy + 1 > _epd_height)
-                                )
-                                    goto DRAW_IMAGE_1BIT_END;
-                            }
-                        }
-                    }
-                    // Next, there will be no more repeat-bits, but
-                    // a byte that denotes the next color to set
-                    payload_bytes_counter = 4;
-                    
-                    if(buf < buf_end) {
-                        if(*buf != COMMAND_FOLLOWS) {
-                            byte = *buf;
-                            buf++;
-                            goto DRAW_IMAGE_1BIT_INNER_LOOP_GET_COLOR;
-                        } else {
-                            if(buf + 1 < buf_end) {
-                                if(*(buf+1)==SEND_128_BYTE) {
-                                    byte = 128;
-                                    buf += 2;
-                                    goto DRAW_IMAGE_1BIT_INNER_LOOP_GET_COLOR;
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                    DRAW_IMAGE_1BIT_CHECK_NEXT_BYTE_FOR_SHIFT_BITS:
-                    if(buf < buf_end) {
-                        if(*buf != COMMAND_FOLLOWS) {
-                            byte = *buf;
-                            buf++;
-                            goto DRAW_IMAGE_1BIT_INNER_LOOP_GET_SHIFT_BITS;
-                        } else {
-                            if(buf + 1 < buf_end) {
-                                if(*(buf+1)==SEND_128_BYTE) {
-                                    byte = 128;
-                                    buf += 2;
-                                    goto DRAW_IMAGE_1BIT_INNER_LOOP_GET_SHIFT_BITS;
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-                switch (payload_bytes_counter) {
-                    case 0: draw_image_width = (uint16_t)byte << 8; break;
-                    case 1: draw_image_width |= (uint16_t)byte; break;
-                    case 2: draw_image_height = (uint16_t)byte << 8; break;
-                    case 3:
-                        draw_image_height |= (uint16_t)byte;
-                        if(
-                            (origin_x_pos+draw_image_width > _epd_width) ||
-                            (origin_y_pos+draw_image_height > _epd_height)
-                        ) {
-                            printf("Image overlaps screen edges, skipping!");
-                            goto DRAW_IMAGE_1BIT_END;
-                        }
-                        ESP_LOGI(TAG, "Damage 1BIT: %ld,%ld - %ld,%ld\n", origin_x_pos, origin_y_pos, draw_image_width, draw_image_height);
-                        break;
-                };
-                payload_bytes_counter += 1;
-                continue;
-                DRAW_IMAGE_1BIT_END:
-                previous_command = current_command;
-                current_command = UNKNOWN_COMMAND;
-                continue;
-
-            case DRAW_IMAGE_4BIT:
-                if( payload_bytes_counter >= 4) {
-                                    
-
-                    if( payload_bytes_counter == 4 ) {
-                        // In the first payload byte we find the color and the
-                        // first three bits of the repeat-information
-                        DRAW_IMAGE_4BIT_INNER_LOOP_GET_COLOR: 
-                        draw_image_color = byte & 0b11111;  // four color bits and one bit for special operations
-                        // we have only 2 bits left of the first byte for repeat information, because the left
-                        // most bit tells if more repeat-bytes follow
-                        draw_image_repeat = (byte >> 5) & 0b11;
-                    } else {
-                        // In every payload byte after that, we find seven more
-                        // lower bits of the repeat information
-                        DRAW_IMAGE_4BIT_INNER_LOOP_GET_SHIFT_BITS:
-                        draw_image_repeat <<= 7;
-                        draw_image_repeat |= byte & 0x7F;
-                    }
-                    //ESP_LOGI(TAG, "DRAW_IMAGE_4BIT color=%d repeats=%"PRIu32, draw_image_color, draw_image_repeat);
-
-                    if( (byte) & 0x80 ) {
-                        // There are more shift-bits to come
-                        payload_bytes_counter += 1;
-                        goto DRAW_IMAGE_4BIT_CHECK_NEXT_BYTE_FOR_SHIFT_BITS;
-                    }
-
-                    // We have gathered all the repeat information
-                    if(draw_image_color==0b10000) {  // draw transparent pixels
-                        // Shortcut to jump over transparent pixels (=no change on fb)
-                        draw_image_repeat += draw_image_current_x + 1;
-                        draw_image_current_y += draw_image_repeat/draw_image_width;
-                        draw_image_current_x = draw_image_repeat%draw_image_width;
-                    } else {  // draw color or invert
-                        uint16_t yy = origin_y_pos + draw_image_current_y;
-                        uint8_t *fb_yy = fb_by_row[yy];
-                        drawn_lines[yy] = true;
-                        drawn_lines_dirty = true;
-                        for(uint32_t px_ctr=0; px_ctr<draw_image_repeat+1;) {
-                            uint16_t xx_start = origin_x_pos + draw_image_current_x;
-                            // xx_stop denotes where we stop drawing the current row of the picture
-                            // (due to different reasons)
-                            uint16_t xx_count = min(
-                                draw_image_repeat+1-px_ctr,
-                                draw_image_width-draw_image_current_x
-                            );
-                            uint8_t *buf_ptr = fb_yy + xx_start;
-                            if(xx_count >= 2) {
-                                // If we have at least 2 repeating pixels left in this row, we take a shortcut,
-                                // as we can skip calculating jumps into the next row, overflowing
-                                // the screen and other checks
-                                uint8_t *buf_ptr_stop = fb_yy + xx_start + xx_count;
-                                // We do differentiate between putting a color and inverting outside
-                                // the loop, so we do not do this branch for every loop iteration again.
-                                if(draw_image_color==0b10001) {  // invert
-                                    for(; buf_ptr<buf_ptr_stop; buf_ptr++){
-                                        *buf_ptr = (*buf_ptr & 0x0F) | (~(*buf_ptr) & 0xF0);
-                                    }
-                                } else {
-                                    for(; buf_ptr<buf_ptr_stop; buf_ptr++){
-                                        *buf_ptr = (*buf_ptr & 0x0F) | (draw_image_color<<4);
-                                    }
-                                }
-                                // Since we only advanced in the row, we only need to update these
-                                // variables
-                                draw_image_current_x += xx_count;
-                                px_ctr += xx_count;
-                            }
-                            else {
-                                // If we have just 1 or zero repeating pixels left in the row, we take
-                                // care of screen dimensions and draw it
-                                if(draw_image_color==0b10001) {
-                                    *buf_ptr = (*buf_ptr & 0x0F) | (~(*buf_ptr) & 0xF0);
-                                } else {
-                                    *buf_ptr = (*buf_ptr & 0x0F) | (draw_image_color<<4);
-                                }
-                                draw_image_current_x++;
-                                px_ctr++;
-                            }
-                            // All the logic of wrapping into the next row etc follows here
-                            if( draw_image_current_x + 1 > draw_image_width ) {
-                                draw_image_current_x = 0;
-                                draw_image_current_y++;
-                                yy++;
-                                fb_yy += _epd_width;
-                                if( 
-                                    (draw_image_current_y + 1 > draw_image_height) ||
-                                    (yy + 1 > _epd_height)
-                                )
-                                    goto DRAW_IMAGE_4BIT_END;
-                                drawn_lines[yy] = true;
-                                drawn_lines_dirty = true;
-                            }
-                        }
-                    }
-                    // Next, there will be no more repeat-bits, but
-                    // a byte that denotes the next color to set
-                    payload_bytes_counter = 4;
-                    
-                    if(buf < buf_end) {
-                        if(*buf != COMMAND_FOLLOWS) {
-                            byte = *buf;
-                            buf++;
-                            goto DRAW_IMAGE_4BIT_INNER_LOOP_GET_COLOR;
-                        } else {
-                            if(buf + 1 < buf_end) {
-                                if(*(buf+1)==SEND_128_BYTE) {
-                                    byte = 128;
-                                    buf += 2;
-                                    goto DRAW_IMAGE_4BIT_INNER_LOOP_GET_COLOR;
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                    DRAW_IMAGE_4BIT_CHECK_NEXT_BYTE_FOR_SHIFT_BITS:
-                    if(buf < buf_end) {
-                        if(*buf != COMMAND_FOLLOWS) {
-                            byte = *buf;
-                            buf++;
-                            goto DRAW_IMAGE_4BIT_INNER_LOOP_GET_SHIFT_BITS;
-                        } else {
-                            if(buf + 1 < buf_end) {
-                                if(*(buf+1)==SEND_128_BYTE) {
-                                    byte = 128;
-                                    buf += 2;
-                                    goto DRAW_IMAGE_4BIT_INNER_LOOP_GET_SHIFT_BITS;
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-                switch (payload_bytes_counter) {
-                    case 0: draw_image_width = (uint16_t)byte << 8; break;
-                    case 1: draw_image_width |= (uint16_t)byte; break;
-                    case 2: draw_image_height = (uint16_t)byte << 8; break;
-                    case 3:
-                        draw_image_height |= (uint16_t)byte;
-                        if(
-                            (origin_x_pos+draw_image_width > _epd_width) ||
-                            (origin_y_pos+draw_image_height > _epd_height)
-                        ) {
-                            printf("Image overlaps screen edges, skipping!");
-                            goto DRAW_IMAGE_4BIT_END;
-                        }
-                        ESP_LOGI(TAG, "Damage 4BIT: %ld,%ld - %ld,%ld\n", origin_x_pos, origin_y_pos, draw_image_width, draw_image_height);
-                        break;
-                };
-                payload_bytes_counter += 1;
-                continue;
-                DRAW_IMAGE_4BIT_END:
-                previous_command = current_command;
-                current_command = UNKNOWN_COMMAND;
-                continue;
-
+ 
             case DRAW_IMAGE_2BIT:
                 if( payload_bytes_counter >= 4) {
 
@@ -730,8 +380,21 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     if(draw_image_color==0b100) {  // draw transparent pixels
                         // Shortcut to jump over transparent pixels (=no change on fb)
                         draw_image_repeat += draw_image_current_x + 1;
-                        draw_image_current_y += draw_image_repeat/draw_image_width;
+                        uint32_t line_jump = draw_image_repeat/draw_image_width;
+                        draw_image_current_y += line_jump;
                         draw_image_current_x = draw_image_repeat%draw_image_width;
+                        if(line_jump) {
+                            My_Cache_Start_DCache_Preload(
+                                ((uint32_t)fb_by_row[draw_image_current_y]) + origin_x_pos,  // start address of the preload region
+                                draw_image_width
+                            );
+                            if(draw_image_current_y<_epd_height) {
+                                My_Cache_Start_DCache_Preload(
+                                    ((uint32_t)fb_by_row[draw_image_current_y+1]) + origin_x_pos,  // start address of the preload region
+                                    draw_image_width
+                                );
+                            }
+                        }
                     } else {  // draw color or invert
                         uint32_t yy = origin_y_pos + draw_image_current_y;
                         uint8_t *fb_yy = fb_by_row[yy];
@@ -767,26 +430,6 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                                 uint8_t *buf_ptr_stop = fb_yy + xx_start + xx_count;
                                 // We do differentiate between putting a color and inverting outside
                                 // the loop, so we do not do this branch for every loop iteration again.
-
-                                // Handle 4 pixels at a time
-                                /*if(draw_image_color==0b101) {  // invert
-                                    for(; buf_ptr<buf_ptr_stop-3; buf_ptr+=4){
-                                        *((uint32_t*)buf_ptr) = (*((uint32_t*)buf_ptr) & 0x0F0F0F0F)
-                                            | (~*((uint32_t*)buf_ptr) & 0xF0F0F0F0);
-                                    }
-                                    for(; buf_ptr<buf_ptr_stop; buf_ptr++){
-                                        *buf_ptr = (*buf_ptr & 0x0F) | (~(*buf_ptr) & 0xF0);
-                                    }
-                                } else {
-                                    for(; buf_ptr<buf_ptr_stop-3; buf_ptr+=4){
-                                        *((uint32_t*)buf_ptr) = (*((uint32_t*)buf_ptr) & 0x0F0F0F0F)
-                                            | draw_image_color_shifted32;
-                                    }
-                                    for(; buf_ptr<buf_ptr_stop; buf_ptr++){
-                                        *buf_ptr = (*buf_ptr & 0x0F) | (draw_image_color&1?0xF0:0x00);
-                                    }
-                                }*/
-
                                 if(draw_image_color==0b101) {  // invert
                                     rpt((buf_ptr_stop - buf_ptr)>>3, [&buf_ptr]() {
                                         uint32_t A = *((uint32_t*)buf_ptr);
@@ -836,18 +479,23 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                                 yy++;
                                 fb_yy += _epd_width;
                                 //ESP_LOGI(TAG, "draw_image_current_y=%ld   draw_image_height=%ld", draw_image_current_y, draw_image_height);
-                                if((yy+1) < _epd_height ) {
-                                    Cache_Start_DCache_Preload(
-                                        ((uint32_t)fb_by_row[yy+1]) + (origin_x_pos & 0xFFFFFF00),  // start address of the preload region
-                                        max(CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE+1, draw_image_width+(origin_x_pos&0xFF)),  // size of the preload region, should not exceed the size of DCache
-                                        0  // the preload order, 0 for positive, other for negative
-                                    );
-                                }
+                                
                                 if( 
                                     (draw_image_current_y + 1 > draw_image_height) ||
                                     (yy + 1 > _epd_height)
                                 )
                                     goto DRAW_IMAGE_2BIT_END;
+                                
+                                My_Cache_Start_DCache_Preload(
+                                    ((uint32_t)fb_by_row[yy]) + origin_x_pos,  // start address of the preload region
+                                    draw_image_width
+                                );
+                                if((yy+1) < _epd_height ) {
+                                    My_Cache_Start_DCache_Preload(
+                                        ((uint32_t)fb_by_row[yy+1]) + origin_x_pos,  // start address of the preload region
+                                        draw_image_width
+                                    );
+                                }
                                 //ensure_current_line_is(yy, origin_x_pos, draw_image_width, yy+1);
                                 drawn_lines[yy] = true;
                                 drawn_lines_dirty = true;
@@ -910,10 +558,9 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                         draw_image_current_x = 0;
                         drawn_columns_start = min(drawn_columns_start, origin_x_pos);
                         drawn_columns_end = max(drawn_columns_end, origin_x_pos+draw_image_width);
-                        Cache_Start_DCache_Preload(
-                            ((uint32_t)fb_by_row[origin_y_pos]) + (origin_x_pos & 0xFFFFFF00),  // start address of the preload region
-                            max(CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE+1, draw_image_width+(origin_x_pos&0xFF)),  // size of the preload region, should not exceed the size of DCache
-                            0  // the preload order, 0 for positive, other for negative
+                        My_Cache_Start_DCache_Preload(
+                            ((uint32_t)fb_by_row[origin_y_pos]) + origin_x_pos,
+                            draw_image_width
                         );
                         //ESP_LOGI(TAG, "Damage 2BIT: %ld,%ld - %ld,%ld\n", origin_x_pos, origin_y_pos, draw_image_width, draw_image_height);
                         break;
@@ -949,22 +596,13 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                         );*/
                         tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, '\n');
                         tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
-
-                        
-                        
-
-                        /*for(uint16_t y=refresh_area_coords.y; y<refresh_area_coords.y+refresh_area_coords.height; y++)
-                            drawn_lines[y] = true;
-                        drawn_lines_dirty = true;
-                        memset(drawn_columns, 0xff, _epd_width / 2);
-                        for(uint16_t xx=refresh_area_coords.x; xx<refresh_area_coords.x+refresh_area_coords.width; xx++)
-                            drawn_columns[xx>>1] |= xx&1? 0x0F : 0xF0;*/
                         
                         break;
                 };
                 payload_bytes_counter += 1;
                 continue;
             default:
+                ESP_LOGI(TAG, "Current command is unknown: %hhu", current_command);
                 break;
         };
     }
@@ -1106,7 +744,7 @@ void idf_setup() {
         .external_phy = false,
         .configuration_descriptor = NULL,
         .self_powered = false,
-        .vbus_monitor_io = NULL, 
+        .vbus_monitor_io = 0,  // ignored because .self_powered = false
     };
 
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
@@ -1138,16 +776,13 @@ void idf_setup() {
 
 void IRAM_ATTR idf_loop() {
 
+    temperature = epd_ambient_temperature();
+    printf("current temperature: %d\n", temperature);
+
     epd_poweron();
     is_powered_on = true;
     //for(uint8_t j=0; j<50; j++)
         epd_clear();
-
-
-    
-    temperature = epd_ambient_temperature();
-
-    printf("current temperature: %d\n", temperature);
 
     for(uint8_t j=0; j<=2; j++) {
         for(uint16_t yy=0; yy<_epd_height; yy++) {
@@ -1158,8 +793,12 @@ void IRAM_ATTR idf_loop() {
             drawn_lines[yy] = true;
         }
         drawn_lines_dirty = true;
+        drawn_columns_start = 0;
+        drawn_columns_end = _epd_width;
         do_refresh();
     }
+
+    ESP_LOGI(TAG, "All refreshes done");
 
     size_t bytes_written;
     uint32_t idle_ctr = 0;
@@ -1180,11 +819,11 @@ void IRAM_ATTR idf_loop() {
                 }
             }
             if(idle_ctr == 500) {
-                if(is_powered_on) {
+                /*if(is_powered_on) {
                     printf("Saving power...\n");
                     epd_poweroff();
                     is_powered_on = false;
-                }
+                }*/
             }
             continue;
         }
