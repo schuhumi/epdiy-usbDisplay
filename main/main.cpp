@@ -11,27 +11,19 @@
 #include <stdio.h>
 #include <string.h>
 
-
 #include <epdiy.h>
 
 #include "mycache.h"
 #include "utils.h"
 #include "asm_templates.h"
+#include "myusb.h"
 
 #include "sdkconfig.h"
 
-
-#include "tinyusb.h"
-#include "tusb_cdc_acm.h"
-
 using namespace std;
 
+static const char *TAG = "EPDiyGraphics";
 extern "C" void app_main();
-
-
-
-
-#define WAVEFORM EPD_BUILTIN_WAVEFORM
 
 // choose the default demo board depending on the architecture
 #ifdef CONFIG_IDF_TARGET_ESP32
@@ -46,8 +38,6 @@ void delay(uint32_t millis) {
 }
 #endif
 
-static const char *TAG = "EPDiyGraphics";
-
 async_memcpy_t async_memcpy_driver;
 
 uint8_t *fb;
@@ -57,23 +47,6 @@ int temperature = 17;
 int _epd_width;
 int _epd_height;
 
-
-
-
-#define NUM_USB_DATA_CHUNKS 32
-struct usb_data_chunk_t {
-    size_t len;
-    uint8_t* data;
-};
-struct usb_data_chunk_t usb_data_chunk[NUM_USB_DATA_CHUNKS];
-StreamBufferHandle_t usb_data_chunks_empty;
-StreamBufferHandle_t usb_data_chunks_full;
-
-
-/*size_t xCDCStreamBufferSize = CONFIG_TINYUSB_CDC_RX_BUFSIZE*2;
-static StreamBufferHandle_t xCDCStreamBuffer = NULL;
-uint8_t *xCDCStreamBufferBuf = NULL;
-StaticStreamBuffer_t xCDCStreamBufferStruct;*/
 
 static inline void checkError(enum EpdDrawError err) {
     if (err != EPD_DRAW_SUCCESS) {
@@ -645,29 +618,7 @@ void IRAM_ATTR tinyusb_cdc_rx_callback(tinyusb_cdcacm_itf_t itf, cdcacm_event_t 
     }
 }
 
-void tinyusb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event)
-{
-    int dtr = event->line_state_changed_data.dtr;
-    int rts = event->line_state_changed_data.rts;
-    ESP_LOGI(TAG, "Line state changed on channel %d: DTR:%d, RTS:%d", itf, dtr, rts);
-}
 
-static tusb_desc_device_t descriptor_config = {
-    .bLength = sizeof(descriptor_config),
-    .bDescriptorType = TUSB_DESC_DEVICE,
-    .bcdUSB = 0x0200,
-    .bDeviceClass = TUSB_CLASS_VENDOR_SPECIFIC, //TUSB_CLASS_MISC,
-    .bDeviceSubClass = MISC_SUBCLASS_COMMON,
-    .bDeviceProtocol = MISC_PROTOCOL_IAD,
-    .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
-    .idVendor = 0x303A, // This is Espressif VID. This needs to be changed according to Users / Customers
-    .idProduct = 0xA299,
-    .bcdDevice = 0x100,
-    .iManufacturer = 0x01,
-    .iProduct = 0x02,
-    .iSerialNumber = 0x03,
-    .bNumConfigurations = 0x01
-};
 
 void idf_setup() {
     async_memcpy_config_t async_memcpy_config = ASYNC_MEMCPY_DEFAULT_CONFIG();
@@ -709,65 +660,16 @@ void idf_setup() {
         epd_rotated_display_height()
     );
 
-    usb_data_chunks_empty = xStreamBufferCreate(
-        NUM_USB_DATA_CHUNKS, // size in bytes
-        1 // trigger level
-    );
-    usb_data_chunks_full = xStreamBufferCreate(
-        NUM_USB_DATA_CHUNKS, // size in bytes
-        1 // trigger level
-    );
-
-    for(uint8_t i=0; i<NUM_USB_DATA_CHUNKS; i++) {
-        usb_data_chunk[i].len = 0;
-        usb_data_chunk[i].data = (uint8_t*)heap_caps_malloc(CONFIG_TINYUSB_CDC_RX_BUFSIZE+1, MALLOC_CAP_INTERNAL);
-
-        xStreamBufferSend(
-            usb_data_chunks_empty,
-            &i, // data to send is the indices
-            1, // just one byte,
-            0  // do not wait for space to become free, because there's enough space
-        );
-    }
+    
 
 
     fb_xSemaphore = xSemaphoreCreateBinaryStatic( &fb_xSemaphoreBuffer );
     xSemaphoreGive( fb_xSemaphore );
 
     /* USB CDC Init */
+    init_usb_data_chunks();
+    init_usb_connection((tusb_cdcacm_callback_t)&tinyusb_cdc_rx_callback);
 
-    ESP_LOGI(TAG, "USB initialization");
-    const tinyusb_config_t tusb_cfg = {
-        .device_descriptor = &descriptor_config, //NULL,
-        .string_descriptor = NULL,
-        .string_descriptor_count = 0,
-        .external_phy = false,
-        .configuration_descriptor = NULL,
-        .self_powered = false,
-        .vbus_monitor_io = 0,  // ignored because .self_powered = false
-    };
-
-    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
-
-    tinyusb_config_cdcacm_t acm_cfg = {
-        .usb_dev = TINYUSB_USBDEV_0,
-        .cdc_port = TINYUSB_CDC_ACM_0,
-        .rx_unread_buf_sz = CONFIG_TINYUSB_CDC_RX_BUFSIZE,
-        .callback_rx = (tusb_cdcacm_callback_t)&tinyusb_cdc_rx_callback, // the first way to register a callback
-        .callback_rx_wanted_char = NULL,
-        .callback_line_state_changed = NULL,
-        .callback_line_coding_changed = NULL
-    };
-
-    ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
-    /* the second way to register a callback */
-    ESP_ERROR_CHECK(tinyusb_cdcacm_register_callback(
-                        TINYUSB_CDC_ACM_0,
-                        CDC_EVENT_LINE_STATE_CHANGED,
-                        &tinyusb_cdc_line_state_changed_callback));
-
-    printf("CONFIG_TINYUSB_CDC_RX_BUFSIZE=%d\n", CONFIG_TINYUSB_CDC_RX_BUFSIZE);
-    ESP_LOGI(TAG, "USB initialization DONE");
 
     heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
     heap_caps_print_heap_info(MALLOC_CAP_SPIRAM);
