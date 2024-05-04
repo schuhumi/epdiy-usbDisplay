@@ -7,7 +7,7 @@
 #include "tinyusb.h"
 #include "tusb_cdc_acm.h"
 
-#define NUM_USB_DATA_CHUNKS 32
+#define NUM_USB_DATA_CHUNKS 128
 struct usb_data_chunk_t {
     size_t len;
     uint8_t* data;
