@@ -52,10 +52,7 @@ enum command {
     SEND_128_BYTE = 0,
     CLEAR_DISPLAY = 1,
     SET_ORIGIN_POS = 2,
-    DRAW_IMAGE_1BIT = 3,
     REFRESH_DISPLAY = 4,
-    REFRESH_AREA = 5,
-    DRAW_IMAGE_4BIT = 7,
     DRAW_IMAGE_2BIT = 8,
     ECHO_SYNC = 252,
     UNKNOWN_COMMAND = 254,
@@ -80,8 +77,6 @@ EpdRect refresh_area_coords;
 bool* drawn_lines;
 uint16_t drawn_columns_start = 0;
 uint16_t drawn_columns_end = 0;
-uint8_t* drawn_columns;
-uint8_t* drawn_columns_cpy;
 bool drawn_lines_dirty = false;
 
 bool is_powered_on;
@@ -98,13 +93,6 @@ const uint8_t DRAM_ATTR transitions[4][4] = {
     {0, 0, 0, 3}
 };
 
-/*uint8_t transitions[4][4] = {
-    {0, 1, 2, 3},
-    {0, 1, 2, 3},
-    {0, 1, 2, 3},
-    {0, 1, 2, 3}
-};*/
-
 void IRAM_ATTR do_refresh(void) {
     uint16_t lines_dirty_ctr;
 
@@ -117,9 +105,8 @@ void IRAM_ATTR do_refresh(void) {
 
     xSemaphoreTake( fb_xSemaphore, ( TickType_t ) portMAX_DELAY );
     do {
-        //memcpy(drawn_columns_cpy, drawn_columns, _epd_width / 2);
         //ESP_LOGI(TAG, "starting drawing (epd_draw_base)");
-        uint32_t t1 = esp_timer_get_time() / 1000;
+        //uint32_t t1 = esp_timer_get_time() / 1000;
         epd_draw_base(
             epd_full_screen(),
             fb,
@@ -127,10 +114,10 @@ void IRAM_ATTR do_refresh(void) {
             (EpdDrawMode)(MODE_DU | MODE_PACKING_1PPB_DIFFERENCE),
             temperature,
             drawn_lines,
-            NULL, //drawn_columns_cpy, // 
+            NULL,
             epd_get_display()->default_waveform
         );
-        uint32_t t2 = esp_timer_get_time() / 1000;
+        //uint32_t t2 = esp_timer_get_time() / 1000;
         //ESP_LOGI(TAG, "[With vector extensions] epd_draw_base took %ldms.", t2 - t1);
 
         lines_dirty_ctr = 0;
@@ -266,14 +253,6 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     current_command = SET_ORIGIN_POS;
                     payload_bytes_counter = 0;
                     continue;
-                case DRAW_IMAGE_1BIT:
-                    //ESP_LOGI(TAG, "Entering Command DRAW_IMAGE_1BIT");
-                    previous_command = current_command;
-                    current_command = DRAW_IMAGE_1BIT;
-                    payload_bytes_counter = 0;
-                    draw_image_current_x = 0;
-                    draw_image_current_y = 0;
-                    continue;
                 case DRAW_IMAGE_2BIT:
                     //ESP_LOGI(TAG, "Entering Command DRAW_IMAGE_2BIT");
                     previous_command = current_command;
@@ -282,26 +261,13 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     draw_image_current_x = 0;
                     draw_image_current_y = 0;
                     continue;
-                case DRAW_IMAGE_4BIT:
-                    //ESP_LOGI(TAG, "Entering Command DRAW_IMAGE_4BIT");
-                    previous_command = current_command;
-                    current_command = DRAW_IMAGE_4BIT;
-                    payload_bytes_counter = 0;
-                    draw_image_current_x = 0;
-                    draw_image_current_y = 0;
-                    continue;
                 case REFRESH_DISPLAY:
-                    //ESP_LOGI(TAG, "Entering Command REFRESH_DISPLAY");
-                    //epd_poweron();
-                    
+                    do_refresh();
+                    tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, 'r'); //REFRESH_AREA);
+                    tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, '\n');
+                    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
                     previous_command = REFRESH_DISPLAY;
                     current_command = UNKNOWN_COMMAND;
-                    continue;
-                case REFRESH_AREA:
-                    //ESP_LOGI(TAG, "Entering Command SET_ORIGIN_POS");
-                    previous_command = current_command;
-                    current_command = REFRESH_AREA;
-                    payload_bytes_counter = 0;
                     continue;
                 case ECHO_SYNC:
                     previous_command = current_command;
@@ -330,12 +296,6 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
  
             case DRAW_IMAGE_2BIT:
                 if( payload_bytes_counter >= 4) {
-
-                    //for(uint16_t xx=origin_x_pos; xx<origin_x_pos+draw_image_width; xx++)
-                    //    drawn_columns[xx>>1] |= xx&1? 0x0F : 0xF0;
-                    //memset(drawn_columns, 0xff, _epd_width / 2);
-                    //for(uint16_t xx=refresh_area_coords.x; xx<refresh_area_coords.x+refresh_area_coords.width; xx++)
-                    //    drawn_columns[xx>>1] |= xx&1? 0xF0 : 0x0F;
 
                     if( payload_bytes_counter == 4 ) {
                         // In the first payload byte we find the color and the
@@ -492,39 +452,10 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                 payload_bytes_counter += 1;
                 continue;
                 DRAW_IMAGE_2BIT_END:
-                //printf("DRAW_IMAGE_2BIT_END before ensure_lines_writeback\n");
-                //ensure_lines_writeback(origin_x_pos, draw_image_width);
-                //printf("DRAW_IMAGE_2BIT_END\n");
                 previous_command = current_command;
                 current_command = UNKNOWN_COMMAND;
                 continue;
 
-            case REFRESH_AREA:
-                switch (payload_bytes_counter) {
-                    case 0: refresh_area_coords.x = ( (uint16_t)byte << 8 ); break;
-                    case 1: refresh_area_coords.x = (refresh_area_coords.x & 0xFF00) | ( (uint16_t)byte ); break;
-                    case 2: refresh_area_coords.y = ( (uint16_t)byte << 8 ); break;
-                    case 3: refresh_area_coords.y = (refresh_area_coords.y & 0xFF00) | ( (uint16_t)byte ); break;
-                    case 4: refresh_area_coords.width = ( (uint16_t)byte << 8 ); break;
-                    case 5: refresh_area_coords.width = (refresh_area_coords.width & 0xFF00) | ( (uint16_t)byte ); break;
-                    case 6: refresh_area_coords.height = ( (uint16_t)byte << 8 ); break;
-                    case 7:
-                        refresh_area_coords.height = (refresh_area_coords.height & 0xFF00) | ( (uint16_t)byte );
-
-                        do_refresh();
-
-                        tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, 'r'); //REFRESH_AREA);
-                        /*tinyusb_cdcacm_write_queue_char(
-                            TINYUSB_CDC_ACM_0, 
-                            (refresh_area_coords.x^refresh_area_coords.y^refresh_area_coords.width^refresh_area_coords.height)&0xFF
-                        );*/
-                        tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, '\n');
-                        tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
-                        
-                        break;
-                };
-                payload_bytes_counter += 1;
-                continue;
             default:
                 ESP_LOGI(TAG, "Current command is unknown: %hhu", current_command);
                 break;
@@ -596,10 +527,6 @@ void idf_setup() {
     }
     drawn_lines = (bool*)heap_caps_malloc(epd_height(), MALLOC_CAP_INTERNAL);
     memset(drawn_lines, 0xff, _epd_height);
-    //drawn_columns = (uint8_t*)heap_caps_aligned_alloc(16, _epd_width / 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    /*memset(drawn_columns, 0xff, _epd_width / 2);
-    drawn_columns_cpy = heap_caps_aligned_alloc(16, _epd_width / 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    memcpy(drawn_columns_cpy, drawn_columns, _epd_width / 2);*/
     drawn_lines_dirty = true;
     
 
@@ -673,11 +600,11 @@ void IRAM_ATTR idf_loop() {
                 }
             }
             if(idle_ctr == 500) {
-                /*if(is_powered_on) {
+                if(is_powered_on) {
                     printf("Saving power...\n");
                     epd_poweroff();
                     is_powered_on = false;
-                }*/
+                }
             }
             continue;
         }
