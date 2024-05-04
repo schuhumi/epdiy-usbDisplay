@@ -48,12 +48,6 @@ int _epd_width;
 int _epd_height;
 
 
-static inline void checkError(enum EpdDrawError err) {
-    if (err != EPD_DRAW_SUCCESS) {
-        ESP_LOGE("demo", "draw error: %X", err);
-    }
-}
-
 enum command {
     SEND_128_BYTE = 0,
     CLEAR_DISPLAY = 1,
@@ -80,6 +74,7 @@ uint32_t draw_image_current_x = 0;
 uint32_t draw_image_current_y = 0;
 uint32_t draw_image_repeat = -1;
 uint8_t draw_image_color = 0;
+uint32_t draw_image_last_cached_line = 0;
 EpdRect refresh_area_coords;
 
 bool* drawn_lines;
@@ -353,22 +348,29 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     if(draw_image_color==0b100) {  // draw transparent pixels
                         // Shortcut to jump over transparent pixels (=no change on fb)
                         draw_image_repeat += draw_image_current_x + 1;
-                        uint32_t line_jump = draw_image_repeat/draw_image_width;
-                        draw_image_current_y += line_jump;
+                        draw_image_current_y += draw_image_repeat/draw_image_width;
                         draw_image_current_x = draw_image_repeat%draw_image_width;
-                        if(line_jump) {
+                    } else {  // draw color or invert
+                        if(draw_image_last_cached_line < draw_image_current_y) {
+                            // Cache the current line we're working on
                             My_Cache_Start_DCache_Preload(
-                                ((uint32_t)fb_by_row[draw_image_current_y]) + origin_x_pos,  // start address of the preload region
+                                ((uint32_t)fb_by_row[draw_image_current_y]) + origin_x_pos,
                                 draw_image_width
                             );
-                            if(draw_image_current_y<_epd_height) {
-                                My_Cache_Start_DCache_Preload(
-                                    ((uint32_t)fb_by_row[draw_image_current_y+1]) + origin_x_pos,  // start address of the preload region
-                                    draw_image_width
-                                );
+                            draw_image_last_cached_line = draw_image_current_y;
+                        } else {
+                            if ((draw_image_last_cached_line == draw_image_current_y) && Cache_DCache_Preload_Done()) {
+                                // Cache the next line we will probably work on, if we're done caching the current one
+                                if(draw_image_current_y+1<_epd_height) {
+                                    My_Cache_Start_DCache_Preload(
+                                        ((uint32_t)fb_by_row[draw_image_current_y+1]) + origin_x_pos,
+                                        draw_image_width
+                                    );
+                                }
+                                draw_image_last_cached_line = draw_image_current_y+1;
                             }
-                        }
-                    } else {  // draw color or invert
+                        } 
+
                         uint32_t yy = origin_y_pos + draw_image_current_y;
                         uint8_t *fb_yy = fb_by_row[yy];
                         //ensure_current_line_is(yy, origin_x_pos, draw_image_width, yy+1);
@@ -458,18 +460,6 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                                     (yy + 1 > _epd_height)
                                 )
                                     goto DRAW_IMAGE_2BIT_END;
-                                
-                                My_Cache_Start_DCache_Preload(
-                                    ((uint32_t)fb_by_row[yy]) + origin_x_pos,  // start address of the preload region
-                                    draw_image_width
-                                );
-                                if((yy+1) < _epd_height ) {
-                                    My_Cache_Start_DCache_Preload(
-                                        ((uint32_t)fb_by_row[yy+1]) + origin_x_pos,  // start address of the preload region
-                                        draw_image_width
-                                    );
-                                }
-                                //ensure_current_line_is(yy, origin_x_pos, draw_image_width, yy+1);
                                 drawn_lines[yy] = true;
                                 drawn_lines_dirty = true;
                             }
@@ -535,6 +525,7 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                             ((uint32_t)fb_by_row[origin_y_pos]) + origin_x_pos,
                             draw_image_width
                         );
+                        draw_image_last_cached_line = origin_y_pos;
                         //ESP_LOGI(TAG, "Damage 2BIT: %ld,%ld - %ld,%ld\n", origin_x_pos, origin_y_pos, draw_image_width, draw_image_height);
                         break;
                 };
