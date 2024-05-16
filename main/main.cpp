@@ -139,10 +139,11 @@ void IRAM_ATTR do_refresh(void) {
                 (uint32_t)fb_by_row[yy] + rpt_chunk_start_offset,
                 rpt_cnt<<2
             );
+            while(!Cache_DCache_Preload_Done());
         }
         while(yy<_epd_height) {
             next_yy = yy+1;
-            while(!drawn_lines[next_yy] && next_yy<_epd_height) {
+            while(next_yy<_epd_height && (!drawn_lines[next_yy])) {
                 next_yy++;
             }
             if(next_yy<_epd_height) {
@@ -151,10 +152,7 @@ void IRAM_ATTR do_refresh(void) {
                     rpt_cnt<<2
                 );
             }
-            //ensure_current_line_is(yy, 0, _epd_width, next_yy);
             if(drawn_lines[yy]) {
-                //memcpy(current_line, fb_by_row[yy], _epd_width);
-                //fb_pixel = current_line;
                 
                 fb_pixel = fb_by_row[yy] + rpt_chunk_start_offset;
                 drawn_lines[yy] = false;
@@ -171,18 +169,18 @@ void IRAM_ATTR do_refresh(void) {
                         news |= transitions[(sources>>2)&0b11][(targets>>2)&0b11]<<0;
                         *((uint32_t*)fb_pixel) = (targets<<4) | (news<<2);
                         if(news!=targets) {
-                            drawn_lines_dirty = true;
                             drawn_lines[yy] = true;
                         }
                     }
                     fb_pixel+=4;
                 });
                 lines_dirty_ctr += drawn_lines[yy];
-                //memcpy(fb_by_row[yy], current_line, _epd_width);
+                if(drawn_lines[yy]) {
+                    drawn_lines_dirty = true;
+                }
             }
             yy = next_yy;
         }
-        //ensure_lines_writeback(0, _epd_width);
         //ESP_LOGI(TAG, "lines_dirty_ctr=%d", lines_dirty_ctr);
     } while(lines_dirty_ctr>100);
     if(!drawn_lines_dirty) {

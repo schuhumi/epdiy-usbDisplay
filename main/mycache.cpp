@@ -17,9 +17,11 @@ void My_Cache_Start_DCache_Preload(uint32_t start, uint32_t len) {
         }
     }
 
+    uint32_t block_start = start & DATA_CACHE_START_MASK;
+    uint32_t block_end = ((start + len) | DATA_CACHE_STOP_MASK) + 1;
     Cache_Start_DCache_Preload(
-        start & DATA_CACHE_START_MASK,  // start address of the preload region
-        (len | DATA_CACHE_STOP_MASK) + 1,  // size of the preload region, should not exceed the size of DCache
+        block_start,  // start address of the preload region
+        block_end - block_start,  // size of the preload region, should not exceed the size of DCache
         0  // the preload order, 0 for positive, other for negative
     );
     dcache_preload_active = true;
