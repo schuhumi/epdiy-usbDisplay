@@ -88,6 +88,12 @@ bool* drawn_lines;
 uint16_t drawn_columns_start = 0;
 uint16_t drawn_columns_end = 0;
 bool drawn_lines_dirty = false;
+bool* refreshed_lines;
+SemaphoreHandle_t refresh_xSemaphore = NULL;
+StaticSemaphore_t refresh_xSemaphoreBuffer;
+volatile bool refreshcompute_active = false;
+uint16_t refreshed_columns_start = 0;
+uint16_t refreshed_columns_end = 0;
 
 bool is_powered_on;
 
@@ -104,7 +110,7 @@ const uint8_t DRAM_ATTR transitions[4][4] = {
 };
 
 void IRAM_ATTR do_refresh(void) {
-    uint16_t lines_dirty_ctr;
+    //uint16_t lines_dirty_ctr;
 
 
     if(drawn_columns_start > drawn_columns_end) {
@@ -113,8 +119,20 @@ void IRAM_ATTR do_refresh(void) {
         drawn_columns_end = _epd_width;
     }
 
-    xSemaphoreTake( fb_xSemaphore, ( TickType_t ) portMAX_DELAY );
-    do {
+    // wait for the parallel drawing task to finish drawing pixels
+    while(xStreamBufferBytesAvailable(draw_pixels_args_empty)<DRAW_PIXELS_QUEUE_LEN) {
+        vTaskDelay(1);
+    }
+
+    //xSemaphoreTake( fb_xSemaphore, ( TickType_t ) portMAX_DELAY );
+    //do {
+        while(refreshcompute_active) {
+            vTaskDelay(1);
+        }
+        memcpy(refreshed_lines, drawn_lines, _epd_height);  // dest, source, size
+        refreshed_columns_end = drawn_columns_end;
+        refreshed_columns_start = drawn_columns_start;
+
         //ESP_LOGI(TAG, "starting drawing (epd_draw_base)");
         //uint32_t t1 = esp_timer_get_time() / 1000;
         epd_draw_base(
@@ -130,16 +148,38 @@ void IRAM_ATTR do_refresh(void) {
         //uint32_t t2 = esp_timer_get_time() / 1000;
         //ESP_LOGI(TAG, "[With vector extensions] epd_draw_base took %ldms.", t2 - t1);
 
-        lines_dirty_ctr = 0;
+        drawn_columns_start = _epd_width;
+        drawn_columns_end = 0;
         drawn_lines_dirty = false;
-        uint32_t rpt_chunk_start_offset = drawn_columns_start & 0xFFFFFF00;
-        uint32_t rpt_cnt = (drawn_columns_end>>2) - (rpt_chunk_start_offset>>2);
-        if(drawn_columns_end & 0b11)
+        xSemaphoreGive( refresh_xSemaphore );
+
+        
+        //ESP_LOGI(TAG, "lines_dirty_ctr=%d", lines_dirty_ctr);
+    //} while(lines_dirty_ctr>100);
+    //if(!drawn_lines_dirty) {
+        
+    //}
+    //xSemaphoreGive( fb_xSemaphore );
+}
+
+void refresh_compute( void * pvParameters )
+{
+    /* The parameter value is expected to be 1 as 1 is passed in the
+       pvParameters value in the call to xTaskCreate() below. */ 
+    configASSERT( ( ( uint32_t ) pvParameters ) == 1 );
+    while(1) {
+        xSemaphoreTake( refresh_xSemaphore, ( TickType_t ) portMAX_DELAY );
+        refreshcompute_active = true;
+
+        //lines_dirty_ctr = 0;
+        uint32_t rpt_chunk_start_offset = refreshed_columns_start & 0xFFFFFF00;
+        uint32_t rpt_cnt = (refreshed_columns_end>>2) - (rpt_chunk_start_offset>>2);
+        if(refreshed_columns_end & 0b11)
             rpt_cnt++;
         uint8_t *fb_pixel = NULL;
         int32_t yy = 0;
         int32_t next_yy;
-        while(!drawn_lines[yy]) {
+        while(!refreshed_lines[yy]) {
             yy++;
             if(yy>=_epd_height)
                 break;
@@ -152,8 +192,9 @@ void IRAM_ATTR do_refresh(void) {
             while(!Cache_DCache_Preload_Done());
         }
         while(yy<_epd_height) {
+            taskYIELD();  // Give the usb task a chance to run, otherwise we might lose data
             next_yy = yy+1;
-            while(next_yy<_epd_height && (!drawn_lines[next_yy])) {
+            while(next_yy<_epd_height && (!refreshed_lines[next_yy])) {
                 next_yy++;
             }
             if(next_yy<_epd_height) {
@@ -162,10 +203,9 @@ void IRAM_ATTR do_refresh(void) {
                     rpt_cnt<<2
                 );
             }
-            if(drawn_lines[yy]) {
-                
-                fb_pixel = fb_by_row[yy] + rpt_chunk_start_offset;
+            if(refreshed_lines[yy]) {
                 drawn_lines[yy] = false;
+                fb_pixel = fb_by_row[yy] + rpt_chunk_start_offset;
                 
                 // Handle 4 pixels at a time
                 rpt(rpt_cnt, [&yy,&fb_pixel]() {
@@ -184,26 +224,29 @@ void IRAM_ATTR do_refresh(void) {
                     }
                     fb_pixel+=4;
                 });
-                lines_dirty_ctr += drawn_lines[yy];
+                //lines_dirty_ctr += drawn_lines[yy];
                 if(drawn_lines[yy]) {
                     drawn_lines_dirty = true;
                 }
+                refreshed_lines[yy] = false;
             }
             yy = next_yy;
         }
-        //ESP_LOGI(TAG, "lines_dirty_ctr=%d", lines_dirty_ctr);
-    } while(lines_dirty_ctr>100);
-    if(!drawn_lines_dirty) {
-        drawn_columns_start = _epd_width;
-        drawn_columns_end = 0;
+        if(drawn_lines_dirty) {
+            drawn_columns_start = min(drawn_columns_start, refreshed_columns_start);
+            drawn_columns_end = max(drawn_columns_end, refreshed_columns_end);
+        }
+        
+        refreshcompute_active = false;
     }
-    xSemaphoreGive( fb_xSemaphore );
+
 }
 
 void draw_pixels(
     struct draw_pixels_args *args
 ) {
     uint32_t yy = origin_y_pos + args->current_y;
+    while(refreshed_lines[yy]) taskYIELD();
     uint8_t *fb_yy = fb_by_row[yy];
     drawn_lines[yy] = true;
     drawn_lines_dirty = true;
@@ -264,6 +307,7 @@ void draw_pixels(
                 return;
             }
             // We will draw the next line in the follwing round of the for-loop
+            while(refreshed_lines[yy]) taskYIELD();
             drawn_lines[yy] = true;
             drawn_lines_dirty = true;
         }
@@ -369,11 +413,6 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     draw_image_current_y = 0;
                     continue;
                 case REFRESH_DISPLAY:
-                    // wait for the parallel drawing task to finish drawing pixels
-                    ESP_LOGI(TAG, "delegate_pixel_drawing_threshold=%lu", delegate_pixel_drawing_threshold>>8);
-                    while(xStreamBufferBytesAvailable(draw_pixels_args_empty)<DRAW_PIXELS_QUEUE_LEN) {
-                        vTaskDelay(1);
-                    }
                     do_refresh();
                     tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, 'r'); //REFRESH_AREA);
                     tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, '\n');
@@ -468,53 +507,55 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
 
                         uint8_t draw_queue_space = xStreamBufferBytesAvailable(draw_pixels_args_empty);
 
-                        if(draw_image_repeat >= (delegate_pixel_drawing_threshold>>8)) {
-                            // Want to delegate drawing to the other core
-                            if(draw_queue_space==0) {
-                                // But there's no space in the queue
-                                // -> We delegated too much before -> increase threshold to do some drawing ourselves
-                                delegate_pixel_drawing_threshold++;
-                            } else {
-                                if(draw_queue_space<DRAW_PIXELS_QUEUE_LEN/2) {
-                                    // We have some space in the queue, but not enough to be pretty sure we get
-                                    // a spot most of the time we want to delegate
+                        if(refreshcompute_active) {
+                            if(draw_image_repeat >= (delegate_pixel_drawing_threshold>>8)) {
+                                // Want to delegate drawing to the other core
+                                if(draw_queue_space==0) {
+                                    // But there's no space in the queue
+                                    // -> We delegated too much before -> increase threshold to do some drawing ourselves
                                     delegate_pixel_drawing_threshold++;
-                                }
-                                if((draw_image_height-draw_image_current_y)>4) {
-                                    // We only delegate the drawing if we're not almost done. Because then we need
-                                    // some time left for the delegated tasks in the queue to finish
-                                    // Put instructions into the queue for the other core to draw
-                                    uint8_t args_index;
-                                    xStreamBufferReceive(
-                                        draw_pixels_args_empty,
-                                        &args_index,
-                                        1, // size
-                                        portMAX_DELAY
-                                    );
+                                } else {
+                                    if(draw_queue_space<DRAW_PIXELS_QUEUE_LEN/2) {
+                                        // We have some space in the queue, but not enough to be pretty sure we get
+                                        // a spot most of the time we want to delegate
+                                        delegate_pixel_drawing_threshold++;
+                                    }
+                                    if((draw_image_height-draw_image_current_y)>4) {
+                                        // We only delegate the drawing if we're not almost done. Because then we need
+                                        // some time left for the delegated tasks in the queue to finish
+                                        // Put instructions into the queue for the other core to draw
+                                        uint8_t args_index;
+                                        xStreamBufferReceive(
+                                            draw_pixels_args_empty,
+                                            &args_index,
+                                            1, // size
+                                            portMAX_DELAY
+                                        );
 
-                                    draw_pixels_queue[args_index].current_x = draw_image_current_x;
-                                    draw_pixels_queue[args_index].current_y = draw_image_current_y;
-                                    draw_pixels_queue[args_index].repeat = draw_image_repeat;
-                                    draw_pixels_queue[args_index].color = draw_image_color;
+                                        draw_pixels_queue[args_index].current_x = draw_image_current_x;
+                                        draw_pixels_queue[args_index].current_y = draw_image_current_y;
+                                        draw_pixels_queue[args_index].repeat = draw_image_repeat;
+                                        draw_pixels_queue[args_index].color = draw_image_color;
 
-                                    xStreamBufferSend(
-                                        draw_pixels_args_full,
-                                        &args_index, // data to send is the index where we wrote
-                                        1, // just one byte,
-                                        portMAX_DELAY
-                                    );
-                                    delegated_drawing = true;
+                                        xStreamBufferSend(
+                                            draw_pixels_args_full,
+                                            &args_index, // data to send is the index where we wrote
+                                            1, // just one byte,
+                                            portMAX_DELAY
+                                        );
+                                        delegated_drawing = true;
+                                    }
                                 }
-                            }
-                        } else {
-                            // Want to draw ourselves
-                            if((draw_queue_space==DRAW_PIXELS_QUEUE_LEN) && (delegate_pixel_drawing_threshold>0)) {
-                                // But the queue for delegation is empty
-                                // -> We drew too much ourselves before
-                                if(draw_image_current_y > 4) {
-                                    // We do not apply this for the first couple of lines to draw, because when
-                                    // starting to draw the queue of course is empty
-                                    delegate_pixel_drawing_threshold--;
+                            } else {
+                                // Want to draw ourselves
+                                if((draw_queue_space==DRAW_PIXELS_QUEUE_LEN) && (delegate_pixel_drawing_threshold>0)) {
+                                    // But the queue for delegation is empty
+                                    // -> We drew too much ourselves before
+                                    if(draw_image_current_y > 4) {
+                                        // We do not apply this for the first couple of lines to draw, because when
+                                        // starting to draw the queue of course is empty
+                                        delegate_pixel_drawing_threshold--;
+                                    }
                                 }
                             }
                         }
@@ -652,6 +693,8 @@ void idf_setup() {
     drawn_lines = (bool*)heap_caps_malloc(epd_height(), MALLOC_CAP_INTERNAL);
     memset(drawn_lines, 0xff, _epd_height);
     drawn_lines_dirty = true;
+    refreshed_lines = (bool*)heap_caps_malloc(epd_height(), MALLOC_CAP_INTERNAL);
+    memset(refreshed_lines, 0x00, _epd_height);
     
 
 
@@ -668,6 +711,8 @@ void idf_setup() {
 
     fb_xSemaphore = xSemaphoreCreateBinaryStatic( &fb_xSemaphoreBuffer );
     xSemaphoreGive( fb_xSemaphore );
+
+    refresh_xSemaphore = xSemaphoreCreateBinaryStatic( &refresh_xSemaphoreBuffer );
 
     /* USB CDC Init */
     init_usb_data_chunks();
@@ -695,6 +740,15 @@ void idf_setup() {
         "vParallelDrawPixelsTask",          /* Text name for the task. */
         2000,      /* Stack size in words, not bytes. */
         ( void * ) 1,    /* Parameter passed into the task. */
+        3,/* Priority at which the task is created. */
+        NULL,             /* Used to pass out the created task's handle. */
+        0                /* Core where the task should run. */
+    );
+    xTaskCreatePinnedToCore(
+        refresh_compute,       /* Function that implements the task. */
+        "refresh_compute",          /* Text name for the task. */
+        2000,      /* Stack size in words, not bytes. */
+        ( void * ) 1,    /* Parameter passed into the task. */
         4,/* Priority at which the task is created. */
         NULL,             /* Used to pass out the created task's handle. */
         0                /* Core where the task should run. */
@@ -717,6 +771,9 @@ void IRAM_ATTR idf_loop() {
 
     for(uint8_t j=0; j<=2; j++) {
         for(uint16_t yy=0; yy<_epd_height; yy++) {
+            while(refreshed_lines[yy]) {
+                vTaskDelay(1);
+            }
             for(uint16_t xx=0; xx<_epd_width; xx++) {
                 uint32_t i = yy*_epd_width+xx;
                 fb[i] = (j&1?0xF0:0x00) | (fb[i]&0x0F);
