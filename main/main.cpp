@@ -40,6 +40,18 @@ void delay(uint32_t millis) {
 
 async_memcpy_t async_memcpy_driver;
 
+struct draw_pixels_args {
+    uint32_t current_x;
+    uint32_t current_y;
+    uint32_t repeat;
+    uint8_t color;
+};
+#define DRAW_PIXELS_QUEUE_LEN 64
+struct draw_pixels_args draw_pixels_queue[DRAW_PIXELS_QUEUE_LEN];
+StreamBufferHandle_t draw_pixels_args_empty;
+StreamBufferHandle_t draw_pixels_args_full;
+uint32_t delegate_pixel_drawing_threshold = 16<<8;
+
 uint8_t *fb;
 uint8_t** fb_by_row;
 uint32_t fb_size;
@@ -69,8 +81,6 @@ uint32_t draw_image_width = 0;
 uint32_t draw_image_height = 0;
 uint32_t draw_image_current_x = 0;
 uint32_t draw_image_current_y = 0;
-uint32_t draw_image_repeat = -1;
-uint8_t draw_image_color = 0;
 uint32_t draw_image_last_cached_line = 0;
 EpdRect refresh_area_coords;
 
@@ -190,6 +200,105 @@ void IRAM_ATTR do_refresh(void) {
     xSemaphoreGive( fb_xSemaphore );
 }
 
+void draw_pixels(
+    struct draw_pixels_args *args
+) {
+    uint32_t yy = origin_y_pos + args->current_y;
+    uint8_t *fb_yy = fb_by_row[yy];
+    drawn_lines[yy] = true;
+    drawn_lines_dirty = true;
+    uint8_t color_shifted = args->color<<6;
+    uint32_t color_shifted32 = 0;
+    if((args->color!=0b101) && (args->repeat>=3)) {
+        color_shifted32 = color_shifted;
+        color_shifted32 |= (color_shifted32<<8)
+            | (color_shifted32<<16)
+            | (color_shifted32<<24);
+    }
+    for(uint32_t px_ctr=0; px_ctr<args->repeat+1;) {
+        uint32_t xx_count = min(
+            args->repeat+1-px_ctr,
+            draw_image_width-args->current_x
+        );
+        uint8_t *buf_ptr = fb_yy + origin_x_pos + args->current_x;
+        // We do differentiate between putting a color and inverting outside
+        // the loop, so we do not do this branch for every loop iteration again.
+        if(args->color==0b101) {  // invert
+            rpt(xx_count>>2, [&buf_ptr]() {
+                uint32_t A = *((uint32_t*)buf_ptr);
+                *((uint32_t*)buf_ptr) = (A & 0x0F0F0F0F) | (~A & 0xF0F0F0F0);
+                buf_ptr += 4;
+            });
+            rpt(xx_count&0b11, [&buf_ptr]() {
+                *buf_ptr = (*buf_ptr & 0x0F) | (~(*buf_ptr) & 0xF0);
+                buf_ptr++;
+            });
+        } else {  // paint color
+            rpt(xx_count>>2, [&buf_ptr, &color_shifted32]() {
+                uint32_t A = *((uint32_t*)buf_ptr);
+                *((uint32_t*)buf_ptr) = (A & 0x0F0F0F0F) | color_shifted32;
+                buf_ptr += 4;
+            });
+            rpt(xx_count&0b11, [&buf_ptr, &color_shifted]() {
+                *buf_ptr = (*buf_ptr & 0x0F) | color_shifted;
+                buf_ptr++;
+            });
+        }
+
+        // Since we only advanced in the row, we only need to update these
+        // variables
+        args->current_x += xx_count;
+        px_ctr += xx_count;
+
+        // All the logic of wrapping into the next row etc follows here
+        if( args->current_x + 1 > draw_image_width ) {
+            args->current_x = 0;
+            args->current_y++;
+            yy++;
+            fb_yy = fb_by_row[yy];
+            
+            if( 
+                (args->current_y + 1 > draw_image_height) ||
+                (yy + 1 > _epd_height)
+            ) {
+                return;
+            }
+            // We will draw the next line in the follwing round of the for-loop
+            drawn_lines[yy] = true;
+            drawn_lines_dirty = true;
+        }
+    }
+}
+
+void vParallelDrawPixelsTask( void * pvParameters )
+{
+    /* The parameter value is expected to be 1 as 1 is passed in the
+       pvParameters value in the call to xTaskCreate() below. */ 
+    configASSERT( ( ( uint32_t ) pvParameters ) == 1 );
+
+    for( ;; )
+    {
+        taskYIELD();  // Give the usb task a chance to run, otherwise we might lose data
+        uint8_t args_index;
+        xStreamBufferReceive(
+            draw_pixels_args_full,
+            &args_index,
+            1, // size
+            portMAX_DELAY
+        );
+        draw_pixels(
+            &draw_pixels_queue[args_index]
+        );
+        xStreamBufferSend(
+            draw_pixels_args_empty,
+            &args_index, // data to send is the index where we wrote
+            1, // just one byte,
+            portMAX_DELAY
+        );
+    }
+}
+
+
 // This macro provides a shortcut to be used in digest_stream(). It can jump to processing the next data byte,
 // without going through all the branches.
 #define if_theres_more_data_goto(where) \
@@ -260,6 +369,11 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     draw_image_current_y = 0;
                     continue;
                 case REFRESH_DISPLAY:
+                    // wait for the parallel drawing task to finish drawing pixels
+                    ESP_LOGI(TAG, "delegate_pixel_drawing_threshold=%lu", delegate_pixel_drawing_threshold>>8);
+                    while(xStreamBufferBytesAvailable(draw_pixels_args_empty)<DRAW_PIXELS_QUEUE_LEN) {
+                        vTaskDelay(1);
+                    }
                     do_refresh();
                     tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, 'r'); //REFRESH_AREA);
                     tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, '\n');
@@ -295,6 +409,8 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
             case DRAW_IMAGE_2BIT:
                 if( payload_bytes_counter >= 4) {
 
+                    static uint32_t draw_image_repeat;
+                    static uint8_t draw_image_color;
                     if( payload_bytes_counter == 4 ) {
                         // In the first payload byte we find the color and the
                         // first three bits of the repeat-information
@@ -348,71 +464,81 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                             }
                         } 
 
-                        uint32_t yy = origin_y_pos + draw_image_current_y;
-                        uint8_t *fb_yy = fb_by_row[yy];
-                        drawn_lines[yy] = true;
-                        drawn_lines_dirty = true;
-                        uint8_t draw_image_color_shifted = draw_image_color<<6;
-                        uint32_t draw_image_color_shifted32 = 0;
-                        if((draw_image_color!=0b101) && (draw_image_repeat>=3)) {
-                            draw_image_color_shifted32 = draw_image_color_shifted;
-                            draw_image_color_shifted32 |= (draw_image_color_shifted32<<8)
-                                | (draw_image_color_shifted32<<16)
-                                | (draw_image_color_shifted32<<24);
-                        }
-                        for(uint32_t px_ctr=0; px_ctr<draw_image_repeat+1;) {
-                            uint32_t xx_count = min(
-                                draw_image_repeat+1-px_ctr,
-                                draw_image_width-draw_image_current_x
-                            );
-                            uint8_t *buf_ptr = fb_yy + origin_x_pos + draw_image_current_x;;
-                            // We do differentiate between putting a color and inverting outside
-                            // the loop, so we do not do this branch for every loop iteration again.
-                            if(draw_image_color==0b101) {  // invert
-                                rpt(xx_count>>2, [&buf_ptr]() {
-                                    uint32_t A = *((uint32_t*)buf_ptr);
-                                    *((uint32_t*)buf_ptr) = (A & 0x0F0F0F0F) | (~A & 0xF0F0F0F0);
-                                    buf_ptr += 4;
-                                });
-                                rpt(xx_count&0b11, [&buf_ptr]() {
-                                    *buf_ptr = (*buf_ptr & 0x0F) | (~(*buf_ptr) & 0xF0);
-                                    buf_ptr++;
-                                });
-                            } else {  // paint color
-                                rpt(xx_count>>2, [&buf_ptr, &draw_image_color_shifted32]() {
-                                    uint32_t A = *((uint32_t*)buf_ptr);
-                                    *((uint32_t*)buf_ptr) = (A & 0x0F0F0F0F) | draw_image_color_shifted32;
-                                    buf_ptr += 4;
-                                });
-                                rpt(xx_count&0b11, [&buf_ptr, &draw_image_color_shifted]() {
-                                    *buf_ptr = (*buf_ptr & 0x0F) | draw_image_color_shifted;
-                                    buf_ptr++;
-                                });
-                            }
+                        bool delegated_drawing = false;
 
-                            // Since we only advanced in the row, we only need to update these
-                            // variables
-                            draw_image_current_x += xx_count;
-                            px_ctr += xx_count;
+                        uint8_t draw_queue_space = xStreamBufferBytesAvailable(draw_pixels_args_empty);
 
-                            // All the logic of wrapping into the next row etc follows here
-                            if( draw_image_current_x + 1 > draw_image_width ) {
-                                draw_image_current_x = 0;
-                                draw_image_current_y++;
-                                yy++;
-                                fb_yy = fb_by_row[yy];
-                                
-                                if( 
-                                    (draw_image_current_y + 1 > draw_image_height) ||
-                                    (yy + 1 > _epd_height)
-                                ) {
-                                    goto DRAW_IMAGE_2BIT_END;
+                        if(draw_image_repeat >= (delegate_pixel_drawing_threshold>>8)) {
+                            // Want to delegate drawing to the other core
+                            if(draw_queue_space==0) {
+                                // But there's no space in the queue
+                                // -> We delegated too much before -> increase threshold to do some drawing ourselves
+                                delegate_pixel_drawing_threshold++;
+                            } else {
+                                if(draw_queue_space<DRAW_PIXELS_QUEUE_LEN/2) {
+                                    // We have some space in the queue, but not enough to be pretty sure we get
+                                    // a spot most of the time we want to delegate
+                                    delegate_pixel_drawing_threshold++;
                                 }
-                                // We will draw the next line in the follwing round of the for-loop
-                                drawn_lines[yy] = true;
-                                drawn_lines_dirty = true;
+                                if((draw_image_height-draw_image_current_y)>4) {
+                                    // We only delegate the drawing if we're not almost done. Because then we need
+                                    // some time left for the delegated tasks in the queue to finish
+                                    // Put instructions into the queue for the other core to draw
+                                    uint8_t args_index;
+                                    xStreamBufferReceive(
+                                        draw_pixels_args_empty,
+                                        &args_index,
+                                        1, // size
+                                        portMAX_DELAY
+                                    );
+
+                                    draw_pixels_queue[args_index].current_x = draw_image_current_x;
+                                    draw_pixels_queue[args_index].current_y = draw_image_current_y;
+                                    draw_pixels_queue[args_index].repeat = draw_image_repeat;
+                                    draw_pixels_queue[args_index].color = draw_image_color;
+
+                                    xStreamBufferSend(
+                                        draw_pixels_args_full,
+                                        &args_index, // data to send is the index where we wrote
+                                        1, // just one byte,
+                                        portMAX_DELAY
+                                    );
+                                    delegated_drawing = true;
+                                }
+                            }
+                        } else {
+                            // Want to draw ourselves
+                            if((draw_queue_space==DRAW_PIXELS_QUEUE_LEN) && (delegate_pixel_drawing_threshold>0)) {
+                                // But the queue for delegation is empty
+                                // -> We drew too much ourselves before
+                                if(draw_image_current_y > 4) {
+                                    // We do not apply this for the first couple of lines to draw, because when
+                                    // starting to draw the queue of course is empty
+                                    delegate_pixel_drawing_threshold--;
+                                }
                             }
                         }
+                        
+                        if(!delegated_drawing){
+                            // draw it directly ourselves
+                            struct draw_pixels_args args;
+                            args.current_x = draw_image_current_x;
+                            args.current_y = draw_image_current_y;
+                            args.repeat = draw_image_repeat;
+                            args.color = draw_image_color;
+                            draw_pixels(&args);
+                        }
+
+                        draw_image_repeat += draw_image_current_x + 1;
+                        draw_image_current_y += draw_image_repeat/draw_image_width;
+                        draw_image_current_x = draw_image_repeat%draw_image_width;
+                        
+                    }
+
+                    if( 
+                        draw_image_current_y + 1 > draw_image_height
+                    ) {
+                        goto DRAW_IMAGE_2BIT_END;
                     }
                     // Next, there will be no more repeat-bits, but
                     // a byte that denotes the next color to set
@@ -547,6 +673,32 @@ void idf_setup() {
     init_usb_data_chunks();
     init_usb_connection((tusb_cdcacm_callback_t)&tinyusb_cdc_rx_callback);
 
+    draw_pixels_args_empty = xStreamBufferCreate(
+        DRAW_PIXELS_QUEUE_LEN, // size in bytes
+        1 // trigger level
+    );
+    draw_pixels_args_full = xStreamBufferCreate(
+        DRAW_PIXELS_QUEUE_LEN, // size in bytes
+        1 // trigger level
+    );
+    for(uint8_t i=0; i<DRAW_PIXELS_QUEUE_LEN; i++) {
+        xStreamBufferSend(
+            draw_pixels_args_empty,
+            &i, // data to send is the indices
+            1, // just one byte,
+            0  // do not wait for space to become free, because there's enough space
+        );
+    }
+
+    xTaskCreatePinnedToCore(
+        vParallelDrawPixelsTask,       /* Function that implements the task. */
+        "vParallelDrawPixelsTask",          /* Text name for the task. */
+        2000,      /* Stack size in words, not bytes. */
+        ( void * ) 1,    /* Parameter passed into the task. */
+        4,/* Priority at which the task is created. */
+        NULL,             /* Used to pass out the created task's handle. */
+        0                /* Core where the task should run. */
+    );
 
     heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
     heap_caps_print_heap_info(MALLOC_CAP_SPIRAM);
