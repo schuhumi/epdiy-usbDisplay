@@ -38,8 +38,6 @@ void delay(uint32_t millis) {
 }
 #endif
 
-async_memcpy_t async_memcpy_driver;
-
 struct draw_pixels_args {
     uint32_t current_x;
     uint32_t current_y;
@@ -89,17 +87,13 @@ uint16_t drawn_columns_start = 0;
 uint16_t drawn_columns_end = 0;
 bool drawn_lines_dirty = false;
 bool* refreshed_lines;
-SemaphoreHandle_t refresh_xSemaphore = NULL;
-StaticSemaphore_t refresh_xSemaphoreBuffer;
 volatile bool refreshcompute_active = false;
 uint16_t refreshed_columns_start = 0;
 uint16_t refreshed_columns_end = 0;
+TaskHandle_t refresh_compute_task = NULL;
 
 bool is_powered_on;
 
-
-SemaphoreHandle_t fb_xSemaphore = NULL;
-StaticSemaphore_t fb_xSemaphoreBuffer;
 
 // indexing: [source][target]
 const uint8_t DRAM_ATTR transitions[4][4] = {
@@ -108,6 +102,13 @@ const uint8_t DRAM_ATTR transitions[4][4] = {
     {3, 1, 2, 3},
     {0, 0, 0, 3}
 };
+
+async_memcpy_t async_memcpy_driver;
+static bool dmacpy_cb(async_memcpy_t hdl, async_memcpy_event_t*, void* args) {
+    BaseType_t r = pdFALSE;
+    xTaskNotifyFromISR((TaskHandle_t)args,0,eNoAction,&r);
+    return (r!=pdFALSE);
+}
 
 void IRAM_ATTR do_refresh(void) {
     //uint16_t lines_dirty_ctr;
@@ -124,42 +125,36 @@ void IRAM_ATTR do_refresh(void) {
         vTaskDelay(1);
     }
 
-    //xSemaphoreTake( fb_xSemaphore, ( TickType_t ) portMAX_DELAY );
-    //do {
-        while(refreshcompute_active) {
-            vTaskDelay(1);
-        }
-        memcpy(refreshed_lines, drawn_lines, _epd_height);  // dest, source, size
-        refreshed_columns_end = drawn_columns_end;
-        refreshed_columns_start = drawn_columns_start;
+    while(refreshcompute_active) {
+        vTaskDelay(1);
+    }
+    TaskHandle_t task = xTaskGetCurrentTaskHandle();
+    esp_async_memcpy(async_memcpy_driver, refreshed_lines, drawn_lines, _epd_height, &dmacpy_cb, (void*)task);
+    //memcpy(refreshed_lines, drawn_lines, _epd_height);  // dest, source, size
+    refreshed_columns_end = drawn_columns_end;
+    refreshed_columns_start = drawn_columns_start;
 
-        //ESP_LOGI(TAG, "starting drawing (epd_draw_base)");
-        //uint32_t t1 = esp_timer_get_time() / 1000;
-        epd_draw_base(
-            epd_full_screen(),
-            fb,
-            epd_full_screen(),
-            (EpdDrawMode)(MODE_DU | MODE_PACKING_1PPB_DIFFERENCE),
-            temperature,
-            drawn_lines,
-            NULL,
-            epd_get_display()->default_waveform
-        );
-        //uint32_t t2 = esp_timer_get_time() / 1000;
-        //ESP_LOGI(TAG, "[With vector extensions] epd_draw_base took %ldms.", t2 - t1);
+    //ESP_LOGI(TAG, "starting drawing (epd_draw_base)");
+    //uint32_t t1 = esp_timer_get_time() / 1000;
+    epd_draw_base(
+        epd_full_screen(),
+        fb,
+        epd_full_screen(),
+        (EpdDrawMode)(MODE_DU | MODE_PACKING_1PPB_DIFFERENCE),
+        temperature,
+        drawn_lines,
+        NULL,
+        epd_get_display()->default_waveform
+    );
+    //uint32_t t2 = esp_timer_get_time() / 1000;
+    //ESP_LOGI(TAG, "[With vector extensions] epd_draw_base took %ldms.", t2 - t1);
 
-        drawn_columns_start = _epd_width;
-        drawn_columns_end = 0;
-        drawn_lines_dirty = false;
-        xSemaphoreGive( refresh_xSemaphore );
+    drawn_columns_start = _epd_width;
+    drawn_columns_end = 0;
+    drawn_lines_dirty = false;
+    xTaskNotifyWait(0,0,NULL,portMAX_DELAY); // Wait for async copy to finish
+    xTaskNotify( refresh_compute_task, 0, eNoAction );
 
-        
-        //ESP_LOGI(TAG, "lines_dirty_ctr=%d", lines_dirty_ctr);
-    //} while(lines_dirty_ctr>100);
-    //if(!drawn_lines_dirty) {
-        
-    //}
-    //xSemaphoreGive( fb_xSemaphore );
 }
 
 void refresh_compute( void * pvParameters )
@@ -168,7 +163,7 @@ void refresh_compute( void * pvParameters )
        pvParameters value in the call to xTaskCreate() below. */ 
     configASSERT( ( ( uint32_t ) pvParameters ) == 1 );
     while(1) {
-        xSemaphoreTake( refresh_xSemaphore, ( TickType_t ) portMAX_DELAY );
+        xTaskNotifyWait(0,0,NULL,portMAX_DELAY); // Wait for computation of new is-state of pixels to be needed
         refreshcompute_active = true;
 
         //lines_dirty_ctr = 0;
@@ -706,13 +701,6 @@ void idf_setup() {
         epd_rotated_display_height()
     );
 
-    
-
-
-    fb_xSemaphore = xSemaphoreCreateBinaryStatic( &fb_xSemaphoreBuffer );
-    xSemaphoreGive( fb_xSemaphore );
-
-    refresh_xSemaphore = xSemaphoreCreateBinaryStatic( &refresh_xSemaphoreBuffer );
 
     /* USB CDC Init */
     init_usb_data_chunks();
@@ -750,7 +738,7 @@ void idf_setup() {
         2000,      /* Stack size in words, not bytes. */
         ( void * ) 1,    /* Parameter passed into the task. */
         4,/* Priority at which the task is created. */
-        NULL,             /* Used to pass out the created task's handle. */
+        &refresh_compute_task,             /* Used to pass out the created task's handle. */
         0                /* Core where the task should run. */
     );
 
