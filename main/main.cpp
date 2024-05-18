@@ -122,11 +122,11 @@ void IRAM_ATTR do_refresh(void) {
 
     // wait for the parallel drawing task to finish drawing pixels
     while(xStreamBufferBytesAvailable(draw_pixels_args_empty)<DRAW_PIXELS_QUEUE_LEN) {
-        vTaskDelay(1);
+        taskYIELD();
     }
 
     while(refreshcompute_active) {
-        vTaskDelay(1);
+        taskYIELD();
     }
     TaskHandle_t task = xTaskGetCurrentTaskHandle();
     esp_async_memcpy(async_memcpy_driver, refreshed_lines, drawn_lines, _epd_height, &dmacpy_cb, (void*)task);
@@ -182,9 +182,9 @@ void refresh_compute( void * pvParameters )
         if(yy<_epd_height) {
             My_Cache_Start_DCache_Preload(
                 (uint32_t)fb_by_row[yy] + rpt_chunk_start_offset,
-                rpt_cnt<<2
+                rpt_cnt<<2,
+                true
             );
-            while(!Cache_DCache_Preload_Done());
         }
         while(yy<_epd_height) {
             taskYIELD();  // Give the usb task a chance to run, otherwise we might lose data
@@ -195,7 +195,8 @@ void refresh_compute( void * pvParameters )
             if(next_yy<_epd_height) {
                 My_Cache_Start_DCache_Preload(
                     ((uint32_t)fb_by_row[next_yy]) + rpt_chunk_start_offset,
-                    rpt_cnt<<2
+                    rpt_cnt<<2,
+                    true
                 );
             }
             if(refreshed_lines[yy]) {
@@ -480,7 +481,8 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                             // Cache the current line we're working on
                             My_Cache_Start_DCache_Preload(
                                 ((uint32_t)fb_by_row[current_image.current_y]) + origin_x_pos,
-                                draw_image_width
+                                draw_image_width,
+                                true
                             );
                             draw_image_last_cached_line = current_image.current_y;
                         } else {
@@ -489,7 +491,8 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                                 if(current_image.current_y+1<_epd_height) {
                                     My_Cache_Start_DCache_Preload(
                                         ((uint32_t)fb_by_row[current_image.current_y+1]) + origin_x_pos,
-                                        draw_image_width
+                                        draw_image_width,
+                                        true
                                     );
                                 }
                                 draw_image_last_cached_line = current_image.current_y+1;
@@ -598,7 +601,8 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                         drawn_columns_end = max(drawn_columns_end, origin_x_pos+draw_image_width);
                         My_Cache_Start_DCache_Preload(
                             ((uint32_t)fb_by_row[origin_y_pos]) + origin_x_pos,
-                            draw_image_width
+                            draw_image_width,
+                            true
                         );
                         draw_image_last_cached_line = origin_y_pos;
                         //ESP_LOGI(TAG, "Damage 2BIT: %ld,%ld - %ld,%ld\n", origin_x_pos, origin_y_pos, draw_image_width, draw_image_height);
@@ -755,7 +759,7 @@ void IRAM_ATTR idf_loop() {
     for(uint8_t j=0; j<=2; j++) {
         for(uint16_t yy=0; yy<_epd_height; yy++) {
             while(refreshed_lines[yy]) {
-                vTaskDelay(1);
+                taskYIELD();
             }
             for(uint16_t xx=0; xx<_epd_width; xx++) {
                 uint32_t i = yy*_epd_width+xx;

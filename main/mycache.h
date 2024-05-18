@@ -14,4 +14,4 @@
     #define DATA_CACHE_STOP_MASK 0x0F
 #endif
 
-void My_Cache_Start_DCache_Preload(uint32_t start, uint32_t len);
+void My_Cache_Start_DCache_Preload(uint32_t start, uint32_t len, bool finish_previous_preload);

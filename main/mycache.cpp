@@ -1,9 +1,11 @@
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "mycache.h"
 
 bool dcache_preload_active = false;
 
-void My_Cache_Start_DCache_Preload(uint32_t start, uint32_t len) {
+void My_Cache_Start_DCache_Preload(uint32_t start, uint32_t len, bool finish_previous_preload) {
     // Start manual preload of a piece of external ram. If a previous preload is still ongoing, it is being
     // stopped.
 
@@ -11,8 +13,14 @@ void My_Cache_Start_DCache_Preload(uint32_t start, uint32_t len) {
         if(Cache_DCache_Preload_Done()) {
             dcache_preload_active = false;
         } else {
-            //ESP_LOGI("MyCache", "DCache preload is still active, stopping it first.");
-            Cache_End_DCache_Preload(0); // Do not start auto-preload
+            if(finish_previous_preload) {
+                while(!Cache_DCache_Preload_Done()) {
+                    taskYIELD();
+                }
+            } else {
+                //ESP_LOGI("MyCache", "DCache preload is still active, stopping it first.");
+                Cache_End_DCache_Preload(0); // Do not start auto-preload
+            }
             dcache_preload_active = false;
         }
     }
