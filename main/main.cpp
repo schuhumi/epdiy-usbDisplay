@@ -39,16 +39,16 @@ void delay(uint32_t millis) {
 #endif
 
 struct draw_pixels_args {
-    uint32_t x;
-    uint32_t y;
+    uint16_t x;
+    uint16_t y;
     uint32_t repeat;
     uint8_t color;
 };
 struct draw_img_ctx {
-    uint32_t x;
-    uint32_t y;
-    uint32_t width;
-    uint32_t height;
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
 };
 
 #define DRAW_PIXELS_QUEUE_LEN 64
@@ -114,7 +114,7 @@ const uint8_t DRAM_ATTR transitions[4][4] = {
 };
 
 async_memcpy_t async_memcpy_driver;
-static bool dmacpy_cb(async_memcpy_t hdl, async_memcpy_event_t*, void* args) {
+static bool IRAM_ATTR dmacpy_cb(async_memcpy_t hdl, async_memcpy_event_t*, void* args) {
     BaseType_t r = pdFALSE;
     xTaskNotifyFromISR((TaskHandle_t)args,0,eNoAction,&r);
     return (r!=pdFALSE);
@@ -167,7 +167,7 @@ void IRAM_ATTR do_refresh(void) {
 
 }
 
-void refresh_compute( void * pvParameters )
+void IRAM_ATTR refresh_compute( void * pvParameters )
 {
     /* The parameter value is expected to be 1 as 1 is passed in the
        pvParameters value in the call to xTaskCreate() below. */ 
@@ -248,7 +248,7 @@ void refresh_compute( void * pvParameters )
 
 }
 
-void draw_pixels(
+void IRAM_ATTR draw_pixels(
     struct draw_pixels_args *args
 ) {
     uint32_t yy = current_image.y + args->y;
@@ -320,7 +320,7 @@ void draw_pixels(
     }
 }
 
-void vParallelDrawPixelsTask( void * pvParameters )
+void IRAM_ATTR vParallelDrawPixelsTask( void * pvParameters )
 {
     /* The parameter value is expected to be 1 as 1 is passed in the
        pvParameters value in the call to xTaskCreate() below. */ 
@@ -351,30 +351,32 @@ void vParallelDrawPixelsTask( void * pvParameters )
 
 // This macro provides a shortcut to be used in digest_stream(). It can jump to processing the next data byte,
 // without going through all the branches.
-#define if_theres_more_data_goto(where) \
+#define if_theres_more_data_goto_otherwise_continue(where) \
+buf++; \
 if(buf < buf_end) { \
     if(*buf != COMMAND_FOLLOWS) { \
         byte = *buf; \
-        buf++; \
         goto where; \
     } else { \
-        if(buf + 1 < buf_end) { \
-            if(*(buf+1)==SEND_128_BYTE) { \
-                byte = 128; \
-                buf += 2; \
-                goto where; \
-            } \
+        if((buf+1<buf_end) && (*(buf+1)==SEND_128_BYTE)) { \
+            buf++; \
+            byte = 128; \
+            goto where; \
         } \
+        goto PARSING_LOOP_FIRST_ENTRY; \
     } \
-}
+} else return;
 
 void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
 {
     uint8_t *buf_end = buf + size;
     
-    while(buf < buf_end) {
-        uint8_t byte = *buf;
+    goto PARSING_LOOP_FIRST_ENTRY;
+    for(;;) {
         buf++;
+        if(buf >= buf_end) break;
+        PARSING_LOOP_FIRST_ENTRY:
+        uint8_t byte = *buf;
 
         // Listen for unique "command follows" byte
         if( byte == COMMAND_FOLLOWS ) {
@@ -440,21 +442,11 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
         }
             
         // process the payload depending on what command we are doing
-        switch(current_command) {
-            case SET_ORIGIN_POS:
-                switch (payload_bytes_counter) {
-                    case 0: current_image.x = (current_image.x & 0x00FF) | ( (uint16_t)byte << 8 ); break;
-                    case 1: current_image.x = (current_image.x & 0xFF00) | ( (uint16_t)byte ); break;
-                    case 2: current_image.y = (current_image.y & 0x00FF) | ( (uint16_t)byte << 8 ); break;
-                    case 3: current_image.y = (current_image.y & 0xFF00) | ( (uint16_t)byte ); break;
-                };
-                payload_bytes_counter += 1;
-                continue;
- 
+        switch(current_command) { 
             case DRAW_IMAGE_2BIT:
-                if( payload_bytes_counter >= 4) {
+                if( payload_bytes_counter >= sizeof(struct draw_img_ctx)) {
 
-                    if( payload_bytes_counter == 4 ) {
+                    if( payload_bytes_counter == sizeof(struct draw_img_ctx) ) {
                         // In the first payload byte we find the color and the
                         // first three bits of the repeat-information
                         DRAW_IMAGE_2BIT_INNER_LOOP_GET_COLOR: 
@@ -474,8 +466,7 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     if( (byte) & 0x80 ) {
                         // There are more shift-bits to come
                         payload_bytes_counter += 1;
-                        if_theres_more_data_goto(DRAW_IMAGE_2BIT_INNER_LOOP_GET_SHIFT_BITS);
-                        continue;
+                        if_theres_more_data_goto_otherwise_continue(DRAW_IMAGE_2BIT_INNER_LOOP_GET_SHIFT_BITS);
                     }
 
                     // We have gathered all the repeat information
@@ -587,48 +578,59 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     }
                     // Next, there will be no more repeat-bits, but
                     // a byte that denotes the next color to set
-                    payload_bytes_counter = 4;
+                    payload_bytes_counter = sizeof(struct draw_img_ctx);
                     
-                    if_theres_more_data_goto(DRAW_IMAGE_2BIT_INNER_LOOP_GET_COLOR);
-                    continue;
+                    if_theres_more_data_goto_otherwise_continue(DRAW_IMAGE_2BIT_INNER_LOOP_GET_COLOR);
+                } else {
+                    DRAW_IMAGE_2BIT_PARSE_IMAGE_HEADER:
+                    //ESP_LOGI(TAG, "payload_bytes_counter: %lu, byte: %hhu", payload_bytes_counter, byte);
+                    switch (payload_bytes_counter) {
+                        case 0: current_image.x = ( (uint16_t)byte ); break;
+                        case 1: current_image.x |= ( (uint16_t)byte ) << 8; break;
+                        case 2: current_image.y = ( (uint16_t)byte ); break;
+                        case 3: current_image.y |= ( (uint16_t)byte )<< 8; break;
+                        case 4: current_image.width = (uint16_t)byte; break;
+                        case 5: current_image.width |= ( (uint16_t)byte ) << 8; break;
+                        case 6: current_image.height = (uint16_t)byte; break;
+                        case 7:
+                            current_image.height |= ( (uint16_t)byte ) << 8;
+                            if(
+                                (current_image.x+current_image.width > _epd_width) ||
+                                (current_image.y+current_image.height > _epd_height)
+                            ) {
+                                ESP_LOGE(TAG, "Image overlaps screen edges, skipping! pos: %u,%u size: %u,%u", current_image.x, current_image.y, current_image.width, current_image.height);
+                                goto DRAW_IMAGE_2BIT_END;
+                            }
+                            current_pixelpack.y = 0;
+                            current_pixelpack.x = 0;
+                            drawn_columns_start = min(drawn_columns_start, current_image.x);
+                            drawn_columns_end = max(drawn_columns_end, current_image.x+current_image.width);
+                            My_Cache_Start_DCache_Preload(
+                                ((uint32_t)fb_by_row[current_image.y]) + current_image.x,
+                                current_image.width,
+                                true
+                            );
+                            draw_image_last_cached_line = current_image.y;
+                            //ESP_LOGI(TAG, "Drawing image 2bit; 
+                            payload_bytes_counter = sizeof(struct draw_img_ctx);
+                            //continue;
+                            if_theres_more_data_goto_otherwise_continue(DRAW_IMAGE_2BIT_INNER_LOOP_GET_COLOR);
+                    };
+                    payload_bytes_counter++;
+                    //continue;
+                    if_theres_more_data_goto_otherwise_continue(DRAW_IMAGE_2BIT_PARSE_IMAGE_HEADER);
                 }
-                //ESP_LOGI(TAG, "Draw 2bit payload bytes counter: %ld", payload_bytes_counter);
-                switch (payload_bytes_counter) {
-                    case 0: current_image.width = (uint16_t)byte << 8; break;
-                    case 1: current_image.width |= (uint16_t)byte; break;
-                    case 2: current_image.height = (uint16_t)byte << 8; break;
-                    case 3:
-                        current_image.height |= (uint16_t)byte;
-                        if(
-                            (current_image.x+current_image.width > _epd_width) ||
-                            (current_image.y+current_image.height > _epd_height)
-                        ) {
-                            printf("Image overlaps screen edges, skipping!");
-                            goto DRAW_IMAGE_2BIT_END;
-                        }
-                        current_pixelpack.y = 0;
-                        current_pixelpack.x = 0;
-                        drawn_columns_start = min(drawn_columns_start, current_image.x);
-                        drawn_columns_end = max(drawn_columns_end, current_image.x+current_image.width);
-                        My_Cache_Start_DCache_Preload(
-                            ((uint32_t)fb_by_row[current_image.y]) + current_image.x,
-                            current_image.width,
-                            true
-                        );
-                        draw_image_last_cached_line = current_image.y;
-                        //ESP_LOGI(TAG, "Damage 2BIT: %ld,%ld - %ld,%ld\n", current_image.x, current_image.y, current_image.width, current_image.height);
-                        break;
-                };
-                payload_bytes_counter += 1;
-                continue;
                 DRAW_IMAGE_2BIT_END:
                 previous_command = current_command;
                 current_command = UNKNOWN_COMMAND;
                 continue;
 
             default:
-                ESP_LOGI(TAG, "Current command is unknown: %hhu", current_command);
-                break;
+                if( current_command != previous_command ) {
+                    ESP_LOGI(TAG, "Current command is unknown: %hhu", current_command);
+                    previous_command = current_command;
+                }
+                continue;
         };
     }
 }
