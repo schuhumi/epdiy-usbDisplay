@@ -39,11 +39,18 @@ void delay(uint32_t millis) {
 #endif
 
 struct draw_pixels_args {
-    uint32_t current_x;
-    uint32_t current_y;
+    uint32_t x;
+    uint32_t y;
     uint32_t repeat;
     uint8_t color;
 };
+struct draw_img_ctx {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+};
+
 #define DRAW_PIXELS_QUEUE_LEN 64
 struct draw_pixels_args draw_pixels_queue[DRAW_PIXELS_QUEUE_LEN];
 StreamBufferHandle_t draw_pixels_args_empty;
@@ -73,13 +80,16 @@ enum command {
 enum command current_command = UNKNOWN_COMMAND;
 enum command previous_command = UNKNOWN_COMMAND; // Needed when SEND_128_BYTE Command comes
 uint32_t payload_bytes_counter = 0;
-uint32_t origin_x_pos = 0;
-uint32_t origin_y_pos = 0;
-uint32_t draw_image_width = 0;
-uint32_t draw_image_height = 0;
 uint32_t draw_image_last_cached_line = 0;
 EpdRect refresh_area_coords;
-struct draw_pixels_args current_image;
+struct draw_pixels_args current_pixelpack;
+struct draw_img_ctx current_image = {
+    .x = 0,
+    .y = 0,
+    .width = 0,
+    .height = 0
+};
+
 
 
 bool* drawn_lines;
@@ -241,7 +251,7 @@ void refresh_compute( void * pvParameters )
 void draw_pixels(
     struct draw_pixels_args *args
 ) {
-    uint32_t yy = origin_y_pos + args->current_y;
+    uint32_t yy = current_image.y + args->y;
     while(refreshed_lines[yy]) taskYIELD();
     uint8_t *fb_yy = fb_by_row[yy];
     drawn_lines[yy] = true;
@@ -257,9 +267,9 @@ void draw_pixels(
     for(uint32_t px_ctr=0; px_ctr<args->repeat+1;) {
         uint32_t xx_count = min(
             args->repeat+1-px_ctr,
-            draw_image_width-args->current_x
+            current_image.width-args->x
         );
-        uint8_t *buf_ptr = fb_yy + origin_x_pos + args->current_x;
+        uint8_t *buf_ptr = fb_yy + current_image.x + args->x;
         // We do differentiate between putting a color and inverting outside
         // the loop, so we do not do this branch for every loop iteration again.
         if(args->color==0b101) {  // invert
@@ -286,18 +296,18 @@ void draw_pixels(
 
         // Since we only advanced in the row, we only need to update these
         // variables
-        args->current_x += xx_count;
+        args->x += xx_count;
         px_ctr += xx_count;
 
         // All the logic of wrapping into the next row etc follows here
-        if( args->current_x + 1 > draw_image_width ) {
-            args->current_x = 0;
-            args->current_y++;
+        if( args->x + 1 > current_image.width ) {
+            args->x = 0;
+            args->y++;
             yy++;
             fb_yy = fb_by_row[yy];
             
             if( 
-                (args->current_y + 1 > draw_image_height) ||
+                (args->y + 1 > current_image.height) ||
                 (yy + 1 > _epd_height)
             ) {
                 return;
@@ -405,8 +415,8 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     previous_command = current_command;
                     current_command = DRAW_IMAGE_2BIT;
                     payload_bytes_counter = 0;
-                    current_image.current_x = 0;
-                    current_image.current_y = 0;
+                    current_pixelpack.x = 0;
+                    current_pixelpack.y = 0;
                     continue;
                 case REFRESH_DISPLAY:
                     do_refresh();
@@ -433,10 +443,10 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
         switch(current_command) {
             case SET_ORIGIN_POS:
                 switch (payload_bytes_counter) {
-                    case 0: origin_x_pos = (origin_x_pos & 0x00FF) | ( (uint16_t)byte << 8 ); break;
-                    case 1: origin_x_pos = (origin_x_pos & 0xFF00) | ( (uint16_t)byte ); break;
-                    case 2: origin_y_pos = (origin_y_pos & 0x00FF) | ( (uint16_t)byte << 8 ); break;
-                    case 3: origin_y_pos = (origin_y_pos & 0xFF00) | ( (uint16_t)byte ); break;
+                    case 0: current_image.x = (current_image.x & 0x00FF) | ( (uint16_t)byte << 8 ); break;
+                    case 1: current_image.x = (current_image.x & 0xFF00) | ( (uint16_t)byte ); break;
+                    case 2: current_image.y = (current_image.y & 0x00FF) | ( (uint16_t)byte << 8 ); break;
+                    case 3: current_image.y = (current_image.y & 0xFF00) | ( (uint16_t)byte ); break;
                 };
                 payload_bytes_counter += 1;
                 continue;
@@ -448,18 +458,18 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                         // In the first payload byte we find the color and the
                         // first three bits of the repeat-information
                         DRAW_IMAGE_2BIT_INNER_LOOP_GET_COLOR: 
-                        current_image.color = byte & 0b111;  // two color bits and one bit for special operations
+                        current_pixelpack.color = byte & 0b111;  // two color bits and one bit for special operations
                         // we have only 4 bits left of the first byte for repeat information, because the left
                         // most bit tells if more repeat-bytes follow
-                        current_image.repeat = (byte >> 3) & 0b1111;
+                        current_pixelpack.repeat = (byte >> 3) & 0b1111;
                     } else {
                         // In every payload byte after that, we find seven more
                         // lower bits of the repeat information
                         DRAW_IMAGE_2BIT_INNER_LOOP_GET_SHIFT_BITS:
-                        current_image.repeat <<= 7;
-                        current_image.repeat |= byte & 0x7F;
+                        current_pixelpack.repeat <<= 7;
+                        current_pixelpack.repeat |= byte & 0x7F;
                     }
-                    //ESP_LOGI(TAG, "DRAW_IMAGE_2BIT color=%d repeats=%"PRIu32, current_image.color, current_image.repeat);
+                    //ESP_LOGI(TAG, "DRAW_IMAGE_2BIT color=%d repeats=%"PRIu32, current_pixelpack.color, current_pixelpack.repeat);
 
                     if( (byte) & 0x80 ) {
                         // There are more shift-bits to come
@@ -469,40 +479,40 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     }
 
                     // We have gathered all the repeat information
-                    if(current_image.color==0b100) {  // draw transparent pixels
+                    if(current_pixelpack.color==0b100) {  // draw transparent pixels
                         // Shortcut to jump over transparent pixels (=no change on fb)
-                        current_image.repeat += current_image.current_x + 1;
-                        current_image.current_y += current_image.repeat/draw_image_width;
-                        current_image.current_x = current_image.repeat%draw_image_width;
+                        current_pixelpack.repeat += current_pixelpack.x + 1;
+                        current_pixelpack.y += current_pixelpack.repeat/current_image.width;
+                        current_pixelpack.x = current_pixelpack.repeat%current_image.width;
                     } else {  // draw color or invert
 
                         // Take care of caching
-                        if(draw_image_last_cached_line < current_image.current_y) {
+                        if(draw_image_last_cached_line < current_pixelpack.y) {
                             // Cache the current line we're working on
                             My_Cache_Start_DCache_Preload(
-                                ((uint32_t)fb_by_row[current_image.current_y]) + origin_x_pos,
-                                draw_image_width,
+                                ((uint32_t)fb_by_row[current_pixelpack.y]) + current_image.x,
+                                current_image.width,
                                 true
                             );
-                            draw_image_last_cached_line = current_image.current_y;
+                            draw_image_last_cached_line = current_pixelpack.y;
                         } else {
-                            if ((draw_image_last_cached_line == current_image.current_y) && Cache_DCache_Preload_Done()) {
+                            if ((draw_image_last_cached_line == current_pixelpack.y) && Cache_DCache_Preload_Done()) {
                                 // Cache the next line we will probably work on, if we're done caching the current one
-                                if(current_image.current_y+1<_epd_height) {
+                                if(current_pixelpack.y+1<_epd_height) {
                                     My_Cache_Start_DCache_Preload(
-                                        ((uint32_t)fb_by_row[current_image.current_y+1]) + origin_x_pos,
-                                        draw_image_width,
+                                        ((uint32_t)fb_by_row[current_pixelpack.y+1]) + current_image.x,
+                                        current_image.width,
                                         true
                                     );
                                 }
-                                draw_image_last_cached_line = current_image.current_y+1;
+                                draw_image_last_cached_line = current_pixelpack.y+1;
                             }
                         } 
 
                         bool delegated_drawing = false;
                         if(refreshcompute_active) {
                             uint8_t draw_queue_space = xStreamBufferBytesAvailable(draw_pixels_args_empty);
-                            if(current_image.repeat >= (delegate_pixel_drawing_threshold>>8)) {
+                            if(current_pixelpack.repeat >= (delegate_pixel_drawing_threshold>>8)) {
                                 // Want to delegate drawing to the other core
                                 if(draw_queue_space==0) {
                                     // But there's no space in the queue
@@ -514,7 +524,7 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                                         // a spot most of the time we want to delegate
                                         delegate_pixel_drawing_threshold++;
                                     }
-                                    if((draw_image_height-current_image.current_y)>4) {
+                                    if((current_image.height-current_pixelpack.y)>4) {
                                         // We only delegate the drawing if we're not almost done. Because then we need
                                         // some time left for the delegated tasks in the queue to finish
                                         // Put instructions into the queue for the other core to draw
@@ -526,10 +536,11 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                                             portMAX_DELAY
                                         );
 
-                                        draw_pixels_queue[args_index].current_x = current_image.current_x;
-                                        draw_pixels_queue[args_index].current_y = current_image.current_y;
-                                        draw_pixels_queue[args_index].repeat = current_image.repeat;
-                                        draw_pixels_queue[args_index].color = current_image.color;
+                                        memcpy(
+                                            &draw_pixels_queue[args_index],
+                                            &current_pixelpack,
+                                            sizeof(struct draw_pixels_args)
+                                        );
 
                                         xStreamBufferSend(
                                             draw_pixels_args_full,
@@ -541,9 +552,9 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                                         // We have to compute the next position to draw ourselves, because the other core
                                         // has probably not done it yet, and also it only does that in its local copy
                                         // of the position information
-                                        current_image.repeat += current_image.current_x + 1;
-                                        current_image.current_y += current_image.repeat/draw_image_width;
-                                        current_image.current_x = current_image.repeat%draw_image_width;
+                                        current_pixelpack.repeat += current_pixelpack.x + 1;
+                                        current_pixelpack.y += current_pixelpack.repeat/current_image.width;
+                                        current_pixelpack.x = current_pixelpack.repeat%current_image.width;
 
                                         delegated_drawing = true;
                                     }
@@ -553,7 +564,7 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                                 if((draw_queue_space==DRAW_PIXELS_QUEUE_LEN) && (delegate_pixel_drawing_threshold>0)) {
                                     // But the queue for delegation is empty
                                     // -> We drew too much ourselves before
-                                    if(current_image.current_y > 4) {
+                                    if(current_pixelpack.y > 4) {
                                         // We do not apply this for the first couple of lines to draw, because when
                                         // starting to draw the queue of course is empty
                                         delegate_pixel_drawing_threshold--;
@@ -564,13 +575,13 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                         
                         if(!delegated_drawing){
                             // draw it directly ourselves
-                            draw_pixels(&current_image);
+                            draw_pixels(&current_pixelpack);
                         }
                         
                     }
 
                     if( 
-                        current_image.current_y + 1 > draw_image_height
+                        current_pixelpack.y + 1 > current_image.height
                     ) {
                         goto DRAW_IMAGE_2BIT_END;
                     }
@@ -583,29 +594,29 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                 }
                 //ESP_LOGI(TAG, "Draw 2bit payload bytes counter: %ld", payload_bytes_counter);
                 switch (payload_bytes_counter) {
-                    case 0: draw_image_width = (uint16_t)byte << 8; break;
-                    case 1: draw_image_width |= (uint16_t)byte; break;
-                    case 2: draw_image_height = (uint16_t)byte << 8; break;
+                    case 0: current_image.width = (uint16_t)byte << 8; break;
+                    case 1: current_image.width |= (uint16_t)byte; break;
+                    case 2: current_image.height = (uint16_t)byte << 8; break;
                     case 3:
-                        draw_image_height |= (uint16_t)byte;
+                        current_image.height |= (uint16_t)byte;
                         if(
-                            (origin_x_pos+draw_image_width > _epd_width) ||
-                            (origin_y_pos+draw_image_height > _epd_height)
+                            (current_image.x+current_image.width > _epd_width) ||
+                            (current_image.y+current_image.height > _epd_height)
                         ) {
                             printf("Image overlaps screen edges, skipping!");
                             goto DRAW_IMAGE_2BIT_END;
                         }
-                        current_image.current_y = 0;
-                        current_image.current_x = 0;
-                        drawn_columns_start = min(drawn_columns_start, origin_x_pos);
-                        drawn_columns_end = max(drawn_columns_end, origin_x_pos+draw_image_width);
+                        current_pixelpack.y = 0;
+                        current_pixelpack.x = 0;
+                        drawn_columns_start = min(drawn_columns_start, current_image.x);
+                        drawn_columns_end = max(drawn_columns_end, current_image.x+current_image.width);
                         My_Cache_Start_DCache_Preload(
-                            ((uint32_t)fb_by_row[origin_y_pos]) + origin_x_pos,
-                            draw_image_width,
+                            ((uint32_t)fb_by_row[current_image.y]) + current_image.x,
+                            current_image.width,
                             true
                         );
-                        draw_image_last_cached_line = origin_y_pos;
-                        //ESP_LOGI(TAG, "Damage 2BIT: %ld,%ld - %ld,%ld\n", origin_x_pos, origin_y_pos, draw_image_width, draw_image_height);
+                        draw_image_last_cached_line = current_image.y;
+                        //ESP_LOGI(TAG, "Damage 2BIT: %ld,%ld - %ld,%ld\n", current_image.x, current_image.y, current_image.width, current_image.height);
                         break;
                 };
                 payload_bytes_counter += 1;
