@@ -120,6 +120,49 @@ static bool IRAM_ATTR dmacpy_cb(async_memcpy_t hdl, async_memcpy_event_t*, void*
     return (r!=pdFALSE);
 }
 
+void IRAM_ATTR write_flush(void) {
+    esp_err_t ret;
+    for(;;) {
+        ret = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 100);
+        if(ret == ESP_OK) {
+            break;
+        }
+        taskYIELD();
+    }
+}
+
+void IRAM_ATTR write_payload_bytes(
+	unsigned char *bytes,
+	unsigned int len
+) {
+    unsigned char cmd128[] = {COMMAND_FOLLOWS, SEND_128_BYTE};
+	unsigned int copy_start = 0;
+    for(unsigned int i=0; i<len; i++) {
+        if( bytes[i]==0x80 ) {
+            tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, &bytes[copy_start], i-copy_start);
+            tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, cmd128, sizeof(cmd128));
+			copy_start = i+1;
+        }
+    }
+	tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, &bytes[copy_start], len-copy_start);
+}
+
+void IRAM_ATTR write_command(
+	unsigned char cmdno,
+	unsigned char *payload,
+	unsigned int plen
+) {
+    unsigned char cmd[] = {
+        COMMAND_FOLLOWS,
+        0x00
+    };
+    cmd[1] = cmdno;
+    tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, cmd, 2);
+    if( payload )
+        write_payload_bytes(payload, plen);
+}
+
+
 void IRAM_ATTR do_refresh(void) {
     //uint16_t lines_dirty_ctr;
 
@@ -421,12 +464,8 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     current_pixelpack.y = 0;
                     continue;
                 case REFRESH_DISPLAY:
-                    do_refresh();
-                    tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, 'r'); //REFRESH_AREA);
-                    tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, '\n');
-                    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
-                    previous_command = REFRESH_DISPLAY;
-                    current_command = UNKNOWN_COMMAND;
+                    previous_command = current_command;
+                    current_command = REFRESH_DISPLAY;
                     continue;
                 case ECHO_SYNC:
                     previous_command = current_command;
@@ -622,6 +661,14 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                 }
                 DRAW_IMAGE_2BIT_END:
                 previous_command = current_command;
+                current_command = UNKNOWN_COMMAND;
+                continue;
+
+            case REFRESH_DISPLAY:
+                do_refresh();
+                write_command(REFRESH_DISPLAY, &byte, 1);
+                write_flush();
+                previous_command = REFRESH_DISPLAY;
                 current_command = UNKNOWN_COMMAND;
                 continue;
 
