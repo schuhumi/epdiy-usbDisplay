@@ -66,20 +66,20 @@ int _epd_height;
 
 
 enum command {
-    SEND_128_BYTE = 0,
-    CLEAR_DISPLAY = 1,
-    SET_ORIGIN_POS = 2,
-    REFRESH_DISPLAY = 4,
-    DRAW_IMAGE_2BIT = 8,
-    ECHO_SYNC = 252,
+    COMMAND_FOLLOWS = 128,
+    SEND_128_BYTE   = 0,
     UNKNOWN_COMMAND = 254,
-    COMMAND_FOLLOWS = 128
+
+    SCREEN_SIZE     = 10,
+
+    CLEAR_DISPLAY   = 100,
+    REFRESH_DISPLAY = 101,
+    DRAW_IMAGE_2BIT = 150
 };
 
 
 enum command current_command = UNKNOWN_COMMAND;
 enum command previous_command = UNKNOWN_COMMAND; // Needed when SEND_128_BYTE Command comes
-uint32_t payload_bytes_counter = 0;
 uint32_t draw_image_last_cached_line = 0;
 EpdRect refresh_area_coords;
 struct draw_pixels_args current_pixelpack;
@@ -412,6 +412,7 @@ if(buf < buf_end) { \
 
 void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
 {
+    static uint32_t payload_bytes_counter = 0;
     uint8_t *buf_end = buf + size;
     
     goto PARSING_LOOP_FIRST_ENTRY;
@@ -438,6 +439,20 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     previous_command = UNKNOWN_COMMAND;
                     byte = 128;  // Will be processed below
                     break;
+                case SCREEN_SIZE:
+                    {
+                        uint8_t screen_size[4] = {
+                            (uint8_t)(_epd_width & 0xFF),
+                            (uint8_t)(_epd_width >> 8),
+                            (uint8_t)(_epd_height & 0xFF),
+                            (uint8_t)(_epd_height >> 8)
+                        };
+                        write_command(SCREEN_SIZE, screen_size, 4);
+                        write_flush();
+                        previous_command = SCREEN_SIZE;
+                        current_command = UNKNOWN_COMMAND;
+                        continue;
+                    }
                 case CLEAR_DISPLAY:
                     ESP_LOGI(TAG, "Entering Command CLEAR_DISPLAY");
                     //epd_poweron();
@@ -448,12 +463,6 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                     //epd_poweroff();
                     previous_command = CLEAR_DISPLAY;
                     current_command = UNKNOWN_COMMAND;
-                    continue;
-                case SET_ORIGIN_POS:
-                    //ESP_LOGI(TAG, "Entering Command SET_ORIGIN_POS");
-                    previous_command = current_command;
-                    current_command = SET_ORIGIN_POS;
-                    payload_bytes_counter = 0;
                     continue;
                 case DRAW_IMAGE_2BIT:
                     //ESP_LOGI(TAG, "Entering Command DRAW_IMAGE_2BIT");
@@ -466,13 +475,6 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                 case REFRESH_DISPLAY:
                     previous_command = current_command;
                     current_command = REFRESH_DISPLAY;
-                    continue;
-                case ECHO_SYNC:
-                    previous_command = current_command;
-                    current_command = UNKNOWN_COMMAND;
-                    tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, ECHO_SYNC);
-                    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
-                    payload_bytes_counter = 0;
                     continue;
                 default:
                     ESP_LOGI(TAG, "do not know how to interpret this byte after 'command follows' byte: %hhu", byte);
@@ -736,7 +738,7 @@ void idf_setup() {
 
     _epd_width = epd_width();
     _epd_height = epd_height();
-    fb_size = epd_width() * epd_height();
+    fb_size = _epd_width * _epd_height;
     //fb = heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM);
     fb = (uint8_t*)heap_caps_aligned_alloc(16, fb_size, MALLOC_CAP_SPIRAM);
     memset(fb, 0xFF, fb_size);
@@ -744,10 +746,10 @@ void idf_setup() {
     for(uint16_t y=0; y<_epd_height; y++) {
         fb_by_row[y] = fb + y*_epd_width;
     }
-    drawn_lines = (bool*)heap_caps_malloc(epd_height(), MALLOC_CAP_INTERNAL);
+    drawn_lines = (bool*)heap_caps_malloc(_epd_height, MALLOC_CAP_INTERNAL);
     memset(drawn_lines, 0xff, _epd_height);
     drawn_lines_dirty = true;
-    refreshed_lines = (bool*)heap_caps_malloc(epd_height(), MALLOC_CAP_INTERNAL);
+    refreshed_lines = (bool*)heap_caps_malloc(_epd_height, MALLOC_CAP_INTERNAL);
     memset(refreshed_lines, 0x00, _epd_height);
     
 
