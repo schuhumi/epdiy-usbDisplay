@@ -5,7 +5,7 @@
 
 bool dcache_preload_active = false;
 
-void My_Cache_Start_DCache_Preload(uint32_t start, uint32_t len, bool finish_previous_preload) {
+void IRAM_ATTR My_Cache_Start_DCache_Preload(uint32_t start, uint32_t len, bool finish_previous_preload) {
     // Start a manual preload of a piece of external ram. The requested region is padded such that
     // the preloading always works (expanded into blocks and one block at a minimum).
     // If a previous preload is still ongoing, it depends on the finish_previous_preload variable

@@ -95,6 +95,7 @@ struct draw_img_ctx current_image = {
 bool* drawn_lines;
 uint16_t drawn_columns_start = 0;
 uint16_t drawn_columns_end = 0;
+SemaphoreHandle_t drawn_columns_semaphore = NULL;
 bool drawn_lines_dirty = false;
 bool* refreshed_lines;
 volatile bool refreshcompute_active = false;
@@ -206,8 +207,8 @@ void IRAM_ATTR do_refresh(void) {
     drawn_columns_end = 0;
     drawn_lines_dirty = false;
     xTaskNotifyWait(0,0,NULL,portMAX_DELAY); // Wait for async copy to finish
+    refreshcompute_active = true;
     xTaskNotify( refresh_compute_task, 0, eNoAction );
-
 }
 
 void IRAM_ATTR refresh_compute( void * pvParameters )
@@ -258,15 +259,19 @@ void IRAM_ATTR refresh_compute( void * pvParameters )
                 
                 // Handle 4 pixels at a time
                 rpt(rpt_cnt, [&yy,&fb_pixel]() {
+                    // 4 block of: 0btt00ss00 (s = source bits, t = target bits)
                     uint32_t sources =*((uint32_t*)fb_pixel);
                     uint32_t targets = (sources>>4)&0x0C0C0C0C;
                     sources &= 0x0C0C0C0C;
+                    // sources looks like this: 0b_0000ss00_0000ss00_0000ss00_0000ss00
+                    // targets looks like this: 0b_0000tt00_0000tt00_0000tt00_0000tt00
                     if(targets!=sources) {
-                        uint32_t news = transitions[(sources>>26)&0b11][(targets>>26)&0b11]<<24;
-                        news |= transitions[(sources>>18)&0b11][(targets>>18)&0b11]<<16;
-                        news |= transitions[(sources>>10)&0b11][(targets>>10)&0b11]<<8;
-                        news |= transitions[(sources>>2)&0b11][(targets>>2)&0b11]<<0;
-                        *((uint32_t*)fb_pixel) = (targets<<4) | (news<<2);
+                        uint32_t news = transitions[(sources>>26)&0b11][(targets>>26)&0b11]<<26;
+                        news |= transitions[(sources>>18)&0b11][(targets>>18)&0b11]<<18;
+                        news |= transitions[(sources>>10)&0b11][(targets>>10)&0b11]<<10;
+                        news |= transitions[(sources>>2)&0b11][(targets>>2)&0b11]<<2;
+                        // news looks like this: 0b_0000nn00_0000nn00_0000nn00_0000nn00
+                        *((uint32_t*)fb_pixel) = (targets<<4) | news;
                         if(news!=targets) {
                             drawn_lines[yy] = true;
                         }
@@ -282,8 +287,10 @@ void IRAM_ATTR refresh_compute( void * pvParameters )
             yy = next_yy;
         }
         if(drawn_lines_dirty) {
-            drawn_columns_start = min(drawn_columns_start, refreshed_columns_start);
-            drawn_columns_end = max(drawn_columns_end, refreshed_columns_end);
+            with_semaphore(drawn_columns_semaphore, {
+                drawn_columns_start = min(drawn_columns_start, refreshed_columns_start);
+                drawn_columns_end = max(drawn_columns_end, refreshed_columns_end);
+            });
         }
         
         refreshcompute_active = false;
@@ -295,18 +302,14 @@ void IRAM_ATTR draw_pixels(
     struct draw_pixels_args *args
 ) {
     uint32_t yy = current_image.y + args->y;
-    while(refreshed_lines[yy]) taskYIELD();
     uint8_t *fb_yy = fb_by_row[yy];
+    uint8_t color_shifted = args->color<<6;
+    uint32_t color_shifted32 = color_shifted;
+    color_shifted32 |= (color_shifted32<<8);
+    color_shifted32 |= (color_shifted32<<16);
+    while(refreshed_lines[yy]) taskYIELD();
     drawn_lines[yy] = true;
     drawn_lines_dirty = true;
-    uint8_t color_shifted = args->color<<6;
-    uint32_t color_shifted32 = 0;
-    if((args->color!=0b101) && (args->repeat>=3)) {
-        color_shifted32 = color_shifted;
-        color_shifted32 |= (color_shifted32<<8)
-            | (color_shifted32<<16)
-            | (color_shifted32<<24);
-    }
     for(uint32_t px_ctr=0; px_ctr<args->repeat+1;) {
         uint32_t xx_count = min(
             args->repeat+1-px_ctr,
@@ -317,12 +320,13 @@ void IRAM_ATTR draw_pixels(
         // the loop, so we do not do this branch for every loop iteration again.
         if(args->color==0b101) {  // invert
             rpt(xx_count>>2, [&buf_ptr]() {
+                // 4 block of: 0btt00ss00 (t = target bits, s = source bits)
                 uint32_t A = *((uint32_t*)buf_ptr);
-                *((uint32_t*)buf_ptr) = (A & 0x0F0F0F0F) | (~A & 0xF0F0F0F0);
+                *((uint32_t*)buf_ptr) = (A & 0x0C0C0C0C) | (~A & 0xC0C0C0C0);
                 buf_ptr += 4;
             });
             rpt(xx_count&0b11, [&buf_ptr]() {
-                *buf_ptr = (*buf_ptr & 0x0F) | (~(*buf_ptr) & 0xF0);
+                *buf_ptr = (*buf_ptr & 0x0C) | (~(*buf_ptr) & 0xC0);
                 buf_ptr++;
             });
         } else {  // paint color
@@ -348,7 +352,6 @@ void IRAM_ATTR draw_pixels(
             args->y++;
             yy++;
             fb_yy = fb_by_row[yy];
-            
             if( 
                 (args->y + 1 > current_image.height) ||
                 (yy + 1 > _epd_height)
@@ -542,7 +545,7 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                         } 
 
                         bool delegated_drawing = false;
-                        if(refreshcompute_active) {
+                        if(!refreshcompute_active) {
                             uint8_t draw_queue_space = xStreamBufferBytesAvailable(draw_pixels_args_empty);
                             if(current_pixelpack.repeat >= (delegate_pixel_drawing_threshold>>8)) {
                                 // Want to delegate drawing to the other core
@@ -644,8 +647,10 @@ void IRAM_ATTR digest_stream(uint8_t* buf, size_t size)
                             }
                             current_pixelpack.y = 0;
                             current_pixelpack.x = 0;
-                            drawn_columns_start = min(drawn_columns_start, current_image.x);
-                            drawn_columns_end = max(drawn_columns_end, current_image.x+current_image.width);
+                            with_semaphore(drawn_columns_semaphore, {
+                                drawn_columns_start = min(drawn_columns_start, current_image.x);
+                                drawn_columns_end = max(drawn_columns_end, current_image.x+current_image.width);
+                            });
                             My_Cache_Start_DCache_Preload(
                                 ((uint32_t)fb_by_row[current_image.y]) + current_image.x,
                                 current_image.width,
@@ -751,7 +756,8 @@ void idf_setup() {
     drawn_lines_dirty = true;
     refreshed_lines = (bool*)heap_caps_malloc(_epd_height, MALLOC_CAP_INTERNAL);
     memset(refreshed_lines, 0x00, _epd_height);
-    
+    drawn_columns_semaphore = xSemaphoreCreateBinary();
+    xSemaphoreGive(drawn_columns_semaphore);
 
 
     // Default orientation is EPD_ROT_LANDSCAPE
@@ -850,7 +856,7 @@ void IRAM_ATTR idf_loop() {
         if(bytes_written == 0) {
             if(idle_ctr < ((uint32_t)2<<30))
                 idle_ctr += 1;
-            if(idle_ctr == 30) {
+            if(idle_ctr >= 30) {
                 while(drawn_lines_dirty) {
                     do_refresh();
                 }
